@@ -31,6 +31,7 @@ from vllm.utils import (Device, as_list, cancel_task_threadsafe, cdiv,
                         deprecate_kwargs)
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.core_client import EngineCoreClient
+from vllm.v1.request import StreamingRequest, StreamingPolicy
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm.v1.engine.output_processor import (OutputProcessor,
                                              RequestOutputCollector)
@@ -686,3 +687,287 @@ class AsyncLLM(EngineClient):
     @property
     def dead_error(self) -> BaseException:
         return EngineDeadError()
+
+
+class StreamingAsyncLLM(AsyncLLM):
+    """Extended AsyncLLM with support for streaming video input and producer-consumer pattern."""
+    
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        
+        # Streaming-specific attributes
+        self.frame_queues: dict[str, asyncio.Queue] = {}
+        self.session_tasks: dict[str, asyncio.Task] = {}
+        self.streaming_sessions: dict[str, dict] = {}  # Store session metadata
+        
+    def set_policy(self,
+                   request_id: str,
+                   latency_budget: Optional[float] = None,
+                   token_budget_share: Optional[float] = None,
+                   vision_stride: Optional[int] = None) -> None:
+        """Update streaming policy for a request.
+        
+        This method forwards policy updates to the underlying engine client.
+        """
+        # Forward to engine core if it supports policy updates
+        if hasattr(self.engine_core, 'set_policy'):
+            return self.engine_core.set_policy(
+                request_id, latency_budget, token_budget_share, vision_stride
+            )
+        else:
+            logger.warning(f"Engine core doesn't support set_policy. "
+                          f"Policy update for {request_id} ignored.")
+        
+    async def start_streaming_session(self,
+                                    session_id: str,
+                                    system_prompt: str,
+                                    initial_policy: Optional[StreamingPolicy] = None) -> AsyncGenerator[RequestOutput, None]:
+        """Start a streaming session with system prompt and initial policy.
+        
+        Args:
+            session_id: Unique identifier for the streaming session
+            system_prompt: System prompt to initialize the session
+            initial_policy: Optional initial streaming policy
+            
+        Returns:
+            AsyncGenerator that yields streaming outputs
+        """
+        # Create frame queue for this session
+        self.frame_queues[session_id] = asyncio.Queue()
+        
+        # Store session metadata
+        self.streaming_sessions[session_id] = {
+            'system_prompt': system_prompt,
+            'start_time': time.time(),
+            'frame_count': 0,
+            'policy': initial_policy
+        }
+        
+        # Create initial streaming request with system prompt
+        initial_request = StreamingRequest(
+            request_id=f"{session_id}_system",
+            session_id=session_id,
+            is_first_chunk=True,
+            frame_sequence_id=0,
+            prompt_token_ids=self.tokenizer.encode(system_prompt) if self.tokenizer else [],
+            multi_modal_kwargs=None,
+            multi_modal_hashes=None,
+            multi_modal_placeholders=None,
+            sampling_params=SamplingParams(max_tokens=1),  # Minimal tokens for prefill
+            pooling_params=None,
+            eos_token_id=None
+        )
+        
+        # Apply initial policy if provided
+        if initial_policy:
+            initial_request.set_policy(**initial_policy.to_dict())
+        
+        # Start frame processing task
+        self.session_tasks[session_id] = asyncio.create_task(
+            self._process_streaming_frames(session_id, initial_request)
+        )
+        
+        logger.info(f"Started streaming session: {session_id}")
+        
+        # Return generator for streaming outputs
+        async for output in self._streaming_generate(session_id):
+            yield output
+            
+    async def add_video_frame(self, session_id: str, frame_data: dict) -> None:
+        """Add a video frame to the session's processing queue.
+        
+        Args:
+            session_id: Session identifier
+            frame_data: Dictionary containing frame data (image, audio, etc.)
+        """
+        if session_id not in self.frame_queues:
+            raise ValueError(f"Session {session_id} not found. Start session first.")
+            
+        await self.frame_queues[session_id].put(frame_data)
+        
+        # Update session metadata
+        if session_id in self.streaming_sessions:
+            self.streaming_sessions[session_id]['frame_count'] += 1
+        
+        logger.debug(f"Added frame to session {session_id}")
+        
+    async def _process_streaming_frames(self, session_id: str, initial_request: StreamingRequest) -> None:
+        """Producer: Process incoming video frames asynchronously."""
+        sequence_id = 1  # Start from 1 since 0 was used for system prompt
+        current_request = initial_request
+        
+        # Process system prompt first
+        try:
+            await self._prefill_system_prompt(session_id, current_request)
+        except Exception as e:
+            logger.error(f"Failed to prefill system prompt for {session_id}: {e}")
+            return
+            
+        while True:
+            try:
+                # Get current policy for timeout calculation
+                policy = current_request.get_policy()
+                timeout = (policy.latency_budget / 1000.0) if policy.latency_budget else 0.1
+                
+                # Wait for new frame with policy-based timeout
+                frame_data = await asyncio.wait_for(
+                    self.frame_queues[session_id].get(),
+                    timeout=timeout
+                )
+                
+                # Check if we should process this frame (vision stride policy)
+                if not current_request.should_process_frame(sequence_id):
+                    logger.debug(f"Skipping frame {sequence_id} due to vision stride policy")
+                    sequence_id += 1
+                    continue
+                
+                # Create streaming request for this frame
+                streaming_request = StreamingRequest(
+                    request_id=f"{session_id}_frame_{sequence_id}",
+                    session_id=session_id,
+                    is_first_chunk=False,
+                    frame_sequence_id=sequence_id,
+                    prompt_token_ids=[],  # Will be filled by processor
+                    multi_modal_kwargs=[frame_data] if frame_data else None,
+                    multi_modal_hashes=None,
+                    multi_modal_placeholders=None,
+                    sampling_params=SamplingParams(
+                        max_tokens=512,
+                        temperature=0.7,
+                        top_p=0.9
+                    ),
+                    pooling_params=None,
+                    eos_token_id=None
+                )
+                
+                # Inherit policy from current request
+                streaming_request.current_policy = current_request.current_policy
+                
+                # Submit request for processing
+                await self._submit_streaming_request(streaming_request)
+                sequence_id += 1
+                
+            except asyncio.TimeoutError:
+                # No new frames within latency budget - continue waiting
+                continue
+            except Exception as e:
+                logger.error(f"Error processing frames for session {session_id}: {e}")
+                break
+                
+        logger.info(f"Frame processing ended for session {session_id}")
+        
+    async def _prefill_system_prompt(self, session_id: str, request: StreamingRequest) -> None:
+        """Process system prompt for session initialization."""
+        try:
+            # Convert to engine core request
+            core_request = await self._convert_to_core_request(request)
+            
+            # Submit to engine core
+            await self.engine_core.add_request(core_request)
+            
+            logger.info(f"System prompt prefilled for session {session_id}")
+            
+        except Exception as e:
+            logger.error(f"Failed to prefill system prompt: {e}")
+            raise
+            
+    async def _submit_streaming_request(self, request: StreamingRequest) -> None:
+        """Submit a streaming request to the engine core."""
+        try:
+            # Convert to engine core request
+            core_request = await self._convert_to_core_request(request)
+            
+            # Submit to engine core
+            await self.engine_core.add_request(core_request)
+            
+            logger.debug(f"Submitted streaming request: {request.request_id}")
+            
+        except Exception as e:
+            logger.error(f"Failed to submit streaming request {request.request_id}: {e}")
+            
+    async def _convert_to_core_request(self, request: StreamingRequest) -> EngineCoreRequest:
+        """Convert StreamingRequest to EngineCoreRequest."""
+        # Process multimodal inputs if present
+        processed_inputs = None
+        if request.multi_modal_kwargs:
+            processed_inputs = self.processor.process_inputs(
+                inputs={"prompt": ""},  # Empty prompt, content in multimodal
+                multi_modal_kwargs=request.multi_modal_kwargs
+            )
+        
+        return EngineCoreRequest(
+            request_id=request.request_id,
+            prompt_token_ids=processed_inputs.prompt_token_ids if processed_inputs else request.prompt_token_ids,
+            mm_kwargs=processed_inputs.mm_kwargs if processed_inputs else request.multi_modal_kwargs,
+            mm_hashes=request.multi_modal_hashes,
+            mm_placeholders=processed_inputs.mm_placeholders if processed_inputs else request.multi_modal_placeholders,
+            sampling_params=request.sampling_params,
+            pooling_params=request.pooling_params,
+            eos_token_id=request.eos_token_id,
+            arrival_time=request.arrival_time,
+            lora_request=request.lora_request
+        )
+        
+    async def _streaming_generate(self, session_id: str) -> AsyncGenerator[RequestOutput, None]:
+        """Consumer: Generate streaming outputs for the session."""
+        session_metadata = self.streaming_sessions.get(session_id, {})
+        
+        try:
+            while True:
+                # Check if session is still active
+                if session_id not in self.streaming_sessions:
+                    break
+                    
+                # Get outputs from engine core
+                async for request_output in self.generate(
+                    inputs=None,  # Inputs are managed by frame processor
+                    sampling_params=None,
+                    use_tqdm=False,
+                    stream_mode=True
+                ):
+                    # Filter outputs for this session
+                    if request_output.request_id.startswith(session_id):
+                        yield request_output
+                        
+                        # Check if request is finished
+                        if request_output.finished:
+                            logger.debug(f"Request finished: {request_output.request_id}")
+                            
+        except Exception as e:
+            logger.error(f"Streaming generation error for session {session_id}: {e}")
+            
+        finally:
+            logger.info(f"Streaming generation ended for session {session_id}")
+            
+    async def stop_streaming_session(self, session_id: str) -> None:
+        """Stop a streaming session and cleanup resources."""
+        # Cancel frame processing task
+        if session_id in self.session_tasks:
+            task = self.session_tasks[session_id]
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            del self.session_tasks[session_id]
+            
+        # Cleanup queues and session metadata
+        if session_id in self.frame_queues:
+            del self.frame_queues[session_id]
+            
+        if session_id in self.streaming_sessions:
+            session_info = self.streaming_sessions[session_id]
+            duration = time.time() - session_info.get('start_time', 0)
+            frame_count = session_info.get('frame_count', 0)
+            logger.info(f"Stopped streaming session {session_id}: "
+                       f"duration={duration:.2f}s, frames={frame_count}")
+            del self.streaming_sessions[session_id]
+            
+    def list_streaming_sessions(self) -> list[str]:
+        """List all active streaming sessions."""
+        return list(self.streaming_sessions.keys())
+        
+    def get_session_info(self, session_id: str) -> Optional[dict]:
+        """Get information about a streaming session."""
+        return self.streaming_sessions.get(session_id)

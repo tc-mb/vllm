@@ -7,6 +7,8 @@ from typing import Any, Callable, Optional, Union
 
 from typing_extensions import TypeVar
 
+import time
+
 import vllm.envs as envs
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import stateless_destroy_torch_distributed_process_group
@@ -28,6 +30,7 @@ from vllm.v1.engine.output_processor import OutputProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.engine.processor import Processor
 from vllm.v1.executor.abstract import Executor
+from vllm.v1.request import StreamingRequest, StreamingPolicy
 from vllm.v1.metrics.loggers import (PrometheusStatLogger, StatLoggerBase,
                                      StatLoggerFactory)
 from vllm.v1.metrics.reader import Metric, get_metrics_snapshot
@@ -324,3 +327,154 @@ class LLMEngine:
     def __del__(self):
         if dp_group := getattr(self, "dp_group", None):
             stateless_destroy_torch_distributed_process_group(dp_group)
+
+
+class SessionState:
+    """State management for streaming sessions."""
+    
+    def __init__(self, max_tokens: int):
+        self.kv_cache_blocks = None
+        self.last_frame_sequence = 0
+        self.context_length = 0
+        self.max_tokens = max_tokens
+        self.allocated_token_budget = 1.0  # Default 100% budget
+        self.session_start_time = time.time()
+        
+    def update_token_budget(self, budget_share: float):
+        """Update token budget allocation based on policy."""
+        self.allocated_token_budget = budget_share
+        self.effective_max_tokens = int(self.max_tokens * budget_share)
+        
+    def reset_kv_cache(self):
+        """Reset KV cache for new session."""
+        self.kv_cache_blocks = None
+        self.context_length = 0
+        self.last_frame_sequence = 0
+
+
+class SessionAwareLLMEngine(LLMEngine):
+    """Extended LLM Engine with support for streaming video sessions and policy management."""
+    
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        
+        # Session management
+        self.active_sessions: dict[str, SessionState] = {}
+        self.session_to_request: dict[str, StreamingRequest] = {}
+        
+    def set_policy(self,
+                   request_id: str,
+                   latency_budget: Optional[float] = None,
+                   token_budget_share: Optional[float] = None,
+                   vision_stride: Optional[int] = None) -> None:
+        """Update streaming policy for a request.
+        
+        Args:
+            request_id: ID of the streaming request
+            latency_budget: Target latency in milliseconds
+            token_budget_share: Fraction of token budget to allocate (0.0-1.0)
+            vision_stride: Process every N video frames
+        """
+        # Find the corresponding StreamingRequest and update its policy
+        for session_id, request in self.session_to_request.items():
+            if request.request_id == request_id:
+                request.set_policy(latency_budget, token_budget_share, vision_stride)
+                
+                # Update session state if token budget changed
+                if token_budget_share is not None:
+                    session = self.active_sessions[session_id]
+                    session.update_token_budget(token_budget_share)
+                
+                logger.info(f"Updated policy for request {request_id}: "
+                           f"latency_budget={latency_budget}ms, "
+                           f"token_budget_share={token_budget_share}, "
+                           f"vision_stride={vision_stride}")
+                return
+                
+        logger.warning(f"Request {request_id} not found for policy update")
+        
+    def create_session(self, session_id: str, initial_request: StreamingRequest) -> None:
+        """Create a new streaming session with initial request."""
+        self.active_sessions[session_id] = SessionState(
+            max_tokens=self.model_config.max_model_len
+        )
+        self.session_to_request[session_id] = initial_request
+        
+        logger.info(f"Created new streaming session: {session_id}")
+        
+    def remove_session(self, session_id: str) -> None:
+        """Remove a streaming session and cleanup resources."""
+        if session_id in self.active_sessions:
+            del self.active_sessions[session_id]
+        if session_id in self.session_to_request:
+            del self.session_to_request[session_id]
+        logger.info(f"Removed streaming session: {session_id}")
+        
+    def streaming_prefill(self, session_id: str, request: StreamingRequest):
+        """Process streaming prefill for incremental frame input."""
+        if session_id not in self.active_sessions:
+            self.create_session(session_id, request)
+            
+        session = self.active_sessions[session_id]
+        
+        # Get policy directly from the request (no external manager needed)
+        policy = request.get_policy()
+        
+        # Apply token budget policy to session
+        if policy.token_budget_share is not None:
+            session.update_token_budget(policy.token_budget_share)
+            
+        # Initialize KV cache for first chunk
+        if request.is_first_chunk:
+            session.reset_kv_cache()
+            logger.info(f"Initialized KV cache for session {session_id}")
+            
+        # Process the incremental frame
+        return self._process_incremental_frame(session, request)
+        
+    def _process_incremental_frame(self, session: SessionState, request: StreamingRequest):
+        """Process a single incremental frame within the session context."""
+        # Apply vision stride policy
+        if not request.should_process_frame(request.frame_sequence_id):
+            logger.debug(f"Skipping frame {request.frame_sequence_id} due to vision stride policy")
+            return None
+            
+        # Check latency budget
+        frame_timestamp = request.get_current_frame_timestamp()
+        if not request.check_latency_budget(frame_timestamp):
+            logger.warning(f"Frame {request.frame_sequence_id} exceeds latency budget")
+            return None
+            
+        # Update session state
+        session.last_frame_sequence = request.frame_sequence_id
+        session.context_length += request.num_prompt_tokens
+        
+        # Check token budget limits
+        effective_budget = request.get_effective_token_budget(session.max_tokens)
+        if session.context_length > effective_budget:
+            logger.warning(f"Session {request.session_id} exceeds token budget "
+                          f"({session.context_length} > {effective_budget})")
+            # Could implement eviction strategy here
+            
+        # Process through normal pipeline
+        try:
+            return self.generate(
+                inputs=request,
+                sampling_params=request.sampling_params,
+                use_tqdm=False
+            )
+        except Exception as e:
+            logger.error(f"Error processing incremental frame: {e}")
+            return None
+            
+    def get_request_by_session(self, session_id: str) -> Optional[StreamingRequest]:
+        """Get the StreamingRequest associated with a session."""
+        return self.session_to_request.get(session_id)
+        
+    def get_session_state(self, session_id: str) -> Optional[SessionState]:
+        """Get the state of a streaming session."""
+        return self.active_sessions.get(session_id)
+        
+    def list_active_sessions(self) -> list[str]:
+        """List all active streaming session IDs."""
+        return list(self.active_sessions.keys())
