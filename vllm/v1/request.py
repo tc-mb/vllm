@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import asyncio
 import enum
 import time
+from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Optional, Union
+from collections import deque
 
 from vllm.multimodal.inputs import MultiModalKwargsItem, PlaceholderRange
 from vllm.pooling_params import PoolingParams
@@ -18,6 +21,22 @@ from vllm.v1.utils import ConstantList
 if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
     from vllm.v1.core.kv_cache_utils import BlockHash
+
+
+@dataclass
+class StreamingPolicy:
+    """Policy configuration for streaming requests."""
+    latency_budget: Optional[float] = None  # Target latency in milliseconds
+    token_budget_share: Optional[float] = None  # Fraction of token budget to allocate (0.0-1.0)
+    vision_stride: Optional[int] = None  # Process every N video frames
+    
+    def to_dict(self) -> dict:
+        """Convert policy to dictionary format."""
+        return {
+            'latency_budget': self.latency_budget,
+            'token_budget_share': self.token_budget_share,
+            'vision_stride': self.vision_stride
+        }
 
 
 class Request:
@@ -206,6 +225,101 @@ class Request:
             return None
         events, self.events = self.events, []
         return events
+
+
+class StreamingRequest(Request):
+    """Extended request class for streaming video/audio input with policy management."""
+    
+    def __init__(self,
+                 session_id: str,
+                 is_first_chunk: bool = False,
+                 frame_sequence_id: int = 0,
+                 **kwargs):
+        super().__init__(**kwargs)
+        
+        # Streaming-specific attributes
+        self.session_id = session_id
+        self.is_first_chunk = is_first_chunk
+        self.frame_sequence_id = frame_sequence_id
+        self.is_streaming = True
+        self.pending_frames = asyncio.Queue() if hasattr(asyncio, 'Queue') else deque()
+        self.current_frame_timestamp = time.time()
+        
+        # Self-managed policy - no external policy manager needed
+        self.current_policy = StreamingPolicy()
+        self.policy_updated_time = time.time()
+        
+        # TDM (Time Division Multiplexing) related attributes
+        self.time_slice_ms = 100  # Default time slice for TDM
+        self.modality_sequence = []  # Track modality processing order
+        
+    def set_policy(self,
+                   latency_budget: Optional[float] = None,
+                   token_budget_share: Optional[float] = None,
+                   vision_stride: Optional[int] = None) -> None:
+        """Update streaming policy directly on the request object."""
+        if latency_budget is not None:
+            self.current_policy.latency_budget = latency_budget
+        if token_budget_share is not None:
+            self.current_policy.token_budget_share = token_budget_share  
+        if vision_stride is not None:
+            self.current_policy.vision_stride = vision_stride
+        self.policy_updated_time = time.time()
+        
+    def get_policy(self) -> StreamingPolicy:
+        """Get current streaming policy."""
+        return self.current_policy
+        
+    def add_frame_chunk(self, frame_data: MultiModalKwargsItem) -> None:
+        """Add a new video/audio frame chunk for processing."""
+        self.current_frame_timestamp = time.time()
+        if hasattr(self.pending_frames, 'put_nowait'):
+            # AsyncIO Queue
+            self.pending_frames.put_nowait(frame_data)
+        else:
+            # Deque fallback
+            self.pending_frames.append(frame_data)
+            
+    def get_current_frame(self) -> Optional[MultiModalKwargsItem]:
+        """Get the next frame to process."""
+        try:
+            if hasattr(self.pending_frames, 'get_nowait'):
+                return self.pending_frames.get_nowait()
+            elif self.pending_frames:
+                return self.pending_frames.popleft()
+        except (asyncio.QueueEmpty, IndexError):
+            pass
+        return None
+        
+    def should_process_frame(self, frame_id: int) -> bool:
+        """Check if current frame should be processed based on vision stride policy."""
+        stride = self.current_policy.vision_stride or 1
+        return frame_id % stride == 0
+        
+    def check_latency_budget(self, frame_timestamp: float) -> bool:
+        """Check if processing this frame would exceed latency budget."""
+        if not self.current_policy.latency_budget:
+            return True
+        current_time = time.time() * 1000  # Convert to ms
+        latency = current_time - (frame_timestamp * 1000)
+        return latency <= self.current_policy.latency_budget
+        
+    def get_current_frame_timestamp(self) -> float:
+        """Get timestamp of current frame being processed."""
+        return self.current_frame_timestamp
+        
+    def get_effective_token_budget(self, base_budget: int) -> int:
+        """Calculate effective token budget based on policy."""
+        if self.current_policy.token_budget_share is None:
+            return base_budget
+        return int(base_budget * self.current_policy.token_budget_share)
+        
+    def has_pending_frames(self) -> bool:
+        """Check if there are pending frames to process."""
+        if hasattr(self.pending_frames, 'empty'):
+            return not self.pending_frames.empty()
+        else:
+            return len(self.pending_frames) > 0
 
 
 class RequestStatus(enum.IntEnum):
