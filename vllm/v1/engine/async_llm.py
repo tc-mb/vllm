@@ -695,6 +695,15 @@ class StreamingAsyncLLM(AsyncLLM):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         
+        from vllm.v1.engine.streaming_processor import StreamingProcessor
+        
+        self.streaming_processor = StreamingProcessor(
+            vllm_config=self.vllm_config,
+            tokenizer=self.tokenizer,
+            mm_registry=self.processor.mm_registry,
+            time_slice_ms=100  
+        )
+        
         # Streaming-specific attributes
         self.frame_queues: dict[str, asyncio.Queue] = {}
         self.session_tasks: dict[str, asyncio.Task] = {}
@@ -886,27 +895,41 @@ class StreamingAsyncLLM(AsyncLLM):
             logger.error(f"Failed to submit streaming request {request.request_id}: {e}")
             
     async def _convert_to_core_request(self, request: StreamingRequest) -> EngineCoreRequest:
-        """Convert StreamingRequest to EngineCoreRequest."""
-        # Process multimodal inputs if present
-        processed_inputs = None
-        if request.multi_modal_kwargs:
-            processed_inputs = self.processor.process_inputs(
-                inputs={"prompt": ""},  # Empty prompt, content in multimodal
-                multi_modal_kwargs=request.multi_modal_kwargs
-            )
+        """Convert StreamingRequest to EngineCoreRequest using StreamingProcessor."""
         
-        return EngineCoreRequest(
-            request_id=request.request_id,
-            prompt_token_ids=processed_inputs.prompt_token_ids if processed_inputs else request.prompt_token_ids,
-            mm_kwargs=processed_inputs.mm_kwargs if processed_inputs else request.multi_modal_kwargs,
-            mm_hashes=request.multi_modal_hashes,
-            mm_placeholders=processed_inputs.mm_placeholders if processed_inputs else request.multi_modal_placeholders,
-            sampling_params=request.sampling_params,
-            pooling_params=request.pooling_params,
-            eos_token_id=request.eos_token_id,
-            arrival_time=request.arrival_time,
-            lora_request=request.lora_request
-        )
+        if isinstance(request, StreamingRequest):
+            
+            try:
+                prompt_str, core_request = self.streaming_processor.process_inputs(
+                    request_id=request.request_id,
+                    prompt=request,  # 直接传递 StreamingRequest 对象
+                    params=request.sampling_params or request.pooling_params,
+                    arrival_time=request.arrival_time,
+                    lora_request=request.lora_request
+                )
+                logger.debug(f"StreamingProcessor processed request {request.request_id} with TDM")
+                return core_request
+                
+            except Exception as e:
+                logger.error(f"StreamingProcessor failed for {request.request_id}: {e}")
+                prompt_str, core_request = self.processor.process_inputs(
+                    request_id=request.request_id,
+                    prompt="",  
+                    params=request.sampling_params or request.pooling_params,
+                    arrival_time=request.arrival_time,
+                    lora_request=request.lora_request,
+                    multi_modal_kwargs=request.multi_modal_kwargs
+                )
+                return core_request
+        else:
+            prompt_str, core_request = self.processor.process_inputs(
+                request_id=request.request_id,
+                prompt="",
+                params=request.sampling_params or request.pooling_params,
+                arrival_time=request.arrival_time,
+                lora_request=request.lora_request
+            )
+            return core_request
         
     async def _streaming_generate(self, session_id: str) -> AsyncGenerator[RequestOutput, None]:
         """Consumer: Generate streaming outputs for the session."""

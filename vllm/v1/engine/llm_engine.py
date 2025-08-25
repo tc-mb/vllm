@@ -358,6 +358,15 @@ class SessionAwareLLMEngine(LLMEngine):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         
+        from vllm.v1.engine.streaming_processor import StreamingProcessor
+        
+        self.streaming_processor = StreamingProcessor(
+            vllm_config=self.vllm_config,
+            tokenizer=self.tokenizer,
+            mm_registry=self.processor.mm_registry,
+            time_slice_ms=100  
+        )
+        
         # Session management
         self.active_sessions: dict[str, SessionState] = {}
         self.session_to_request: dict[str, StreamingRequest] = {}
