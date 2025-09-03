@@ -4,13 +4,16 @@
 from dataclasses import dataclass
 from typing import Optional
 
+import time
+from typing import Dict
+
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import PrefixCacheStats
-from vllm.v1.request import Request, RequestStatus
+from vllm.v1.request import Request, RequestStatus, StreamingRequest, StreamingPolicy
 
 logger = init_logger(__name__)
 
@@ -362,3 +365,350 @@ class KVCacheManager:
         """Creates a new KVCacheBlocks instance with no blocks."""
         return KVCacheBlocks(tuple([]
                                    for _ in range(self.num_kv_cache_groups)))
+
+
+@dataclass
+class SessionCacheState:
+    """State tracking for streaming session KV cache with sequence management."""
+    session_id: str
+    kv_cache_blocks: Optional[KVCacheBlocks] = None
+    last_frame_sequence: int = 0
+    context_length: int = 0
+    max_tokens: int = 0
+    allocated_token_budget: float = 1.0  # Default 100% budget
+    effective_max_tokens: int = 0
+    session_start_time: float = 0
+    last_access_time: float = 0
+    
+    # Sequence tracking inspired by MiniCPM-o
+    last_completed_sequence: int = 0  # Last fully processed sequence
+    processing_sequences: set = None  # Currently processing sequences
+    max_context_capacity: int = 8192   # Maximum context before reset
+    
+    def __post_init__(self):
+        if self.session_start_time == 0:
+            self.session_start_time = time.time()
+        if self.last_access_time == 0:
+            self.last_access_time = time.time()
+        if self.effective_max_tokens == 0:
+            self.effective_max_tokens = int(self.max_tokens * self.allocated_token_budget)
+        if self.processing_sequences is None:
+            self.processing_sequences = set()
+    
+    def update_token_budget(self, budget_share: float):
+        """Update token budget allocation based on streaming policy."""
+        self.allocated_token_budget = budget_share
+        self.effective_max_tokens = int(self.max_tokens * budget_share)
+        self.last_access_time = time.time()
+        
+    def reset_kv_cache(self):
+        """Reset KV cache for new session."""
+        self.kv_cache_blocks = None
+        self.context_length = 0
+        self.last_completed_sequence = 0
+        self.processing_sequences.clear()
+        
+    def start_processing_sequence(self, seq_id: int):
+        """Mark sequence as starting processing."""
+        self.processing_sequences.add(seq_id)
+        logger.debug(f"Session {self.session_id} started processing sequence {seq_id}")
+        
+    def complete_sequence(self, seq_id: int):
+        """Mark sequence as completed."""
+        self.processing_sequences.discard(seq_id)
+        self.last_completed_sequence = max(self.last_completed_sequence, seq_id)
+        logger.debug(f"Session {self.session_id} completed sequence {seq_id}")
+        
+    def check_capacity_overflow(self, additional_tokens: int = 0) -> bool:
+        """Check if adding more tokens would cause capacity overflow inspired by MiniCPM-o."""
+        projected_length = self.context_length + additional_tokens
+        return projected_length >= self.max_context_capacity * 0.9  # 90% threshold
+        
+    def should_reset_cache(self) -> bool:
+        """Determine if cache should be reset due to capacity issues."""
+        return (self.context_length >= self.max_context_capacity or 
+                self.context_length >= self.effective_max_tokens)
+                
+    def touch(self):
+        """Update last access time for LRU tracking."""
+        self.last_access_time = time.time()
+
+
+class SessionAwareKVCacheManager(KVCacheManager):
+    """Extended KV Cache Manager with support for streaming session management and policy-based budgeting."""
+    
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        
+        # Session-level cache management
+        self.session_caches: Dict[str, SessionCacheState] = {}
+        self.session_cleanup_threshold = 3600  # Cleanup sessions inactive for 1 hour
+        self.last_cleanup_time = time.time()
+        
+        logger.info("Initialized SessionAwareKVCacheManager with session-level cache management")
+        
+    def get_session_cache(self, session_id: str, max_tokens: Optional[int] = None) -> SessionCacheState:
+        """Get or create session-level KV cache state.
+        
+        Args:
+            session_id: Unique session identifier
+            max_tokens: Maximum tokens for this session (defaults to model max)
+            
+        Returns:
+            SessionCacheState for the given session
+        """
+        if session_id not in self.session_caches:
+            self.session_caches[session_id] = SessionCacheState(
+                session_id=session_id,
+                max_tokens=max_tokens or self.max_model_len,
+                session_start_time=time.time()
+            )
+            logger.debug(f"Created new session cache: {session_id}")
+            
+        session_cache = self.session_caches[session_id]
+        session_cache.touch()
+        return session_cache
+        
+    def append_kv_cache_with_policy(self, 
+                                  session_id: str,
+                                  new_kv_data: KVCacheBlocks,
+                                  policy: StreamingPolicy,
+                                  sequence_id: int = None) -> KVCacheBlocks:
+        """Append KV cache data to a session with policy constraints and capacity management.
+        
+        Args:
+            session_id: Session identifier
+            new_kv_data: New KV cache blocks to append
+            policy: Streaming policy with budget constraints
+            sequence_id: Sequence ID for tracking
+            
+        Returns:
+            Updated KV cache blocks for the session
+        """
+        session_cache = self.get_session_cache(session_id)
+        
+        # Apply token budget policy
+        if policy.token_budget_share is not None:
+            session_cache.update_token_budget(policy.token_budget_share)
+        
+        # Mark sequence as processing if provided
+        if sequence_id is not None:
+            session_cache.start_processing_sequence(sequence_id)
+            
+        # Check capacity overflow inspired by MiniCPM-o
+        new_tokens = self._estimate_kv_length(new_kv_data)
+        
+        if session_cache.check_capacity_overflow(new_tokens):
+            logger.warning(f"Session {session_id} approaching capacity limit, "
+                          f"context_length={session_cache.context_length}, "
+                          f"new_tokens={new_tokens}, "
+                          f"capacity={session_cache.max_context_capacity}")
+            
+            # Apply reset strategy if necessary
+            if session_cache.should_reset_cache():
+                logger.info(f"Resetting KV cache for session {session_id} due to capacity overflow")
+                session_cache.reset_kv_cache()
+                
+        projected_length = session_cache.context_length + new_tokens
+        
+        # Check token budget constraints
+        if projected_length > session_cache.effective_max_tokens:
+            logger.warning(f"Session {session_id} would exceed token budget "
+                          f"({projected_length} > {session_cache.effective_max_tokens}), "
+                          f"applying eviction policy")
+            session_cache = self._evict_cache_blocks(session_cache, projected_length)
+            
+        # Append new KV data
+        if session_cache.kv_cache_blocks is None:
+            session_cache.kv_cache_blocks = new_kv_data
+        else:
+            session_cache.kv_cache_blocks = session_cache.kv_cache_blocks + new_kv_data
+            
+        # Update context length and mark sequence as completed
+        session_cache.context_length = projected_length
+        if sequence_id is not None:
+            session_cache.complete_sequence(sequence_id)
+        session_cache.touch()
+        
+        return session_cache.kv_cache_blocks
+        
+    def get_session_computed_blocks(self, 
+                                  session_id: str,
+                                  request: StreamingRequest) -> tuple[KVCacheBlocks, int]:
+        """Get computed blocks for a streaming session with incremental processing.
+        
+        Args:
+            session_id: Session identifier
+            request: Streaming request
+            
+        Returns:
+            Tuple of (computed blocks, number of computed tokens)
+        """
+        session_cache = self.get_session_cache(session_id)
+        
+        # For streaming requests, we can reuse session-level cached blocks
+        if session_cache.kv_cache_blocks is not None and not request.is_first_chunk:
+            # Return existing blocks for incremental processing
+            return session_cache.kv_cache_blocks, session_cache.context_length
+        else:
+            # First chunk or no cache - use standard prefix cache logic
+            return self.get_computed_blocks(request)
+            
+    def allocate_session_slots(self,
+                             session_id: str, 
+                             request: StreamingRequest,
+                             num_new_tokens: int,
+                             num_computed_tokens: int = 0) -> KVCacheBlocks:
+        """Allocate KV cache slots for a streaming session.
+        
+        Args:
+            session_id: Session identifier
+            request: Streaming request
+            num_new_tokens: Number of new tokens to allocate
+            num_computed_tokens: Number of already computed tokens
+            
+        Returns:
+            Allocated KV cache blocks
+        """
+        session_cache = self.get_session_cache(session_id)
+        policy = request.get_policy()
+        
+        # Apply token budget constraints
+        if policy.token_budget_share is not None:
+            session_cache.update_token_budget(policy.token_budget_share)
+            
+        # Check budget before allocation
+        total_tokens = session_cache.context_length + num_new_tokens
+        if total_tokens > session_cache.effective_max_tokens:
+            # Reduce allocation to fit budget
+            available_tokens = max(0, session_cache.effective_max_tokens - session_cache.context_length)
+            num_new_tokens = min(num_new_tokens, available_tokens)
+            logger.debug(f"Reduced allocation for session {session_id} due to budget: "
+                        f"{num_new_tokens} tokens")
+            
+        if num_new_tokens <= 0:
+            return self.create_empty_block_list()
+            
+        # Use standard allocation logic
+        allocated_blocks = self.allocate_slots(request, num_new_tokens, num_computed_tokens)
+        
+        # Update session state
+        session_cache.context_length += num_new_tokens
+        session_cache.touch()
+        
+        return allocated_blocks
+        
+    def _estimate_kv_length(self, kv_blocks: KVCacheBlocks) -> int:
+        """Estimate the number of tokens represented by KV cache blocks."""
+        if not kv_blocks.blocks or not kv_blocks.blocks[0]:
+            return 0
+        # Rough estimate: block_size * number of blocks
+        return len(kv_blocks.blocks[0]) * (self.block_size or 16)
+        
+    def _evict_cache_blocks(self, 
+                          session_cache: SessionCacheState,
+                          target_length: int) -> SessionCacheState:
+        """Evict cache blocks when session exceeds token budget.
+        
+        Implements a simple strategy: keep most recent blocks up to budget.
+        """
+        if session_cache.kv_cache_blocks is None:
+            return session_cache
+            
+        # Calculate how many blocks to keep
+        blocks_to_keep = session_cache.effective_max_tokens // (self.block_size or 16)
+        
+        if blocks_to_keep <= 0:
+            # No budget - clear all blocks
+            session_cache.reset_kv_cache()
+            logger.info(f"Cleared all cache blocks for session {session_cache.session_id} "
+                       f"due to zero token budget")
+        else:
+            # Keep most recent blocks
+            for group_idx, group in enumerate(session_cache.kv_cache_blocks.blocks):
+                if len(group) > blocks_to_keep:
+                    # Keep last N blocks
+                    session_cache.kv_cache_blocks.blocks[group_idx] = group[-blocks_to_keep:]
+                    
+            # Update context length
+            session_cache.context_length = min(
+                session_cache.context_length, 
+                session_cache.effective_max_tokens
+            )
+            
+            logger.info(f"Evicted cache blocks for session {session_cache.session_id}: "
+                       f"kept {blocks_to_keep} blocks, "
+                       f"context_length={session_cache.context_length}")
+                       
+        return session_cache
+        
+    def remove_session(self, session_id: str) -> None:
+        """Remove a streaming session and cleanup its cache resources."""
+        if session_id in self.session_caches:
+            session_cache = self.session_caches[session_id]
+            duration = time.time() - session_cache.session_start_time
+            
+            # Cleanup any allocated blocks
+            if session_cache.kv_cache_blocks is not None:
+                # Note: In a full implementation, we'd need to return blocks to pool
+                pass
+                
+            del self.session_caches[session_id]
+            logger.info(f"Removed session cache {session_id}: "
+                       f"duration={duration:.2f}s, "
+                       f"context_length={session_cache.context_length}")
+                       
+    def cleanup_inactive_sessions(self, max_age_seconds: Optional[int] = None) -> int:
+        """Cleanup sessions that have been inactive for too long.
+        
+        Args:
+            max_age_seconds: Maximum age for inactive sessions (default: class threshold)
+            
+        Returns:
+            Number of sessions cleaned up
+        """
+        max_age = max_age_seconds or self.session_cleanup_threshold
+        current_time = time.time()
+        
+        # Only run cleanup periodically
+        if current_time - self.last_cleanup_time < 300:  # 5 minutes
+            return 0
+            
+        inactive_sessions = []
+        for session_id, session_cache in self.session_caches.items():
+            age = current_time - session_cache.last_access_time
+            if age > max_age:
+                inactive_sessions.append(session_id)
+                
+        # Remove inactive sessions
+        for session_id in inactive_sessions:
+            self.remove_session(session_id)
+            
+        self.last_cleanup_time = current_time
+        
+        if inactive_sessions:
+            logger.info(f"Cleaned up {len(inactive_sessions)} inactive sessions")
+            
+        return len(inactive_sessions)
+        
+    def get_session_stats(self) -> Dict[str, Dict[str, any]]:
+        """Get statistics for all active sessions."""
+        stats = {}
+        current_time = time.time()
+        
+        for session_id, session_cache in self.session_caches.items():
+            stats[session_id] = {
+                'context_length': session_cache.context_length,
+                'max_tokens': session_cache.max_tokens,
+                'effective_max_tokens': session_cache.effective_max_tokens,
+                'token_budget_share': session_cache.allocated_token_budget,
+                'duration': current_time - session_cache.session_start_time,
+                'inactive_time': current_time - session_cache.last_access_time,
+                'last_frame_sequence': session_cache.last_frame_sequence
+            }
+            
+        return stats
+        
+    def list_active_sessions(self) -> list[str]:
+        """List all active streaming session IDs."""
+        return list(self.session_caches.keys())
