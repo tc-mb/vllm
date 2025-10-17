@@ -29,7 +29,10 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from functools import partial
 from itertools import chain
-from typing import Annotated, Any, Literal, TypeAlias
+from typing import (
+    Annotated, Any, Literal, TypeAlias,
+    assert_never, TYPE_CHECKING
+)
 
 import numpy as np
 import torch
@@ -58,7 +61,7 @@ from vllm.multimodal.inputs import (
     MultiModalFieldConfig,
     MultiModalKwargsItems,
     NestedTensors,
-)
+    HfVideoItem)
 from vllm.multimodal.parse import (
     DictEmbeddingItems,
     ImageItem,
@@ -86,6 +89,10 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.collection_utils import flatten_2d_lists
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 from vllm.utils.torch_utils import set_default_torch_dtype
+if TYPE_CHECKING:
+    import PIL.Image as PILImage
+else:
+    PILImage = LazyLoader("PILImage", globals(), "PIL.Image")
 
 from .idefics2_vision_model import Idefics2VisionTransformer
 from .interfaces import (
@@ -460,6 +467,7 @@ def _minicpmv_field_config(hf_inputs: Mapping[str, torch.Tensor]):
         video_image_sizes=MultiModalFieldConfig.batched("video"),
         video_tgt_sizes=MultiModalFieldConfig.batched("video"),
         video_embeds=MultiModalFieldConfig.batched("video"),
+        video_temporal_ids=MultiModalFieldConfig.batched("video"),
     )
 
 
@@ -507,8 +515,41 @@ class MiniCPMVVideoEmbeddingItems(DictEmbeddingItems):
     def get_num_frames(self, index: int) -> int:
         return len(self.get(index)["video_image_sizes"])
 
+class MiniCPMVVideoProcessorItems(VideoProcessorItems):
+
+    def get_num_frames(self, index: int) -> int:
+        item = self.get(index)
+        video = item[0] if isinstance(item, tuple) else item
+        return len(video)
+    
+    def get_num_chunks(self, index: int) -> int:
+        item = self.get(index)
+        if isinstance(item, tuple):
+            metadata = item[1]
+            if metadata is not None and "temporal_ids" in metadata:
+                return len(metadata["temporal_ids"])
+            else:
+                return self.get_num_frames(index)
+        else:
+            return self.get_num_frames(index)
+
+    def get_frame_size(self, index: int) -> ImageSize:
+        item = self.get(index)
+        if isinstance(item, tuple):
+            item = item[0]
+        image = item[0]  # Assume that the video isn't empty
+        if isinstance(image, PILImage.Image):
+            return ImageSize(*image.size)
+        if isinstance(image, (np.ndarray, torch.Tensor)):
+            _, h, w = image.shape
+            return ImageSize(w, h)
+        assert_never(image)
 
 class MiniCPMVMultiModalDataParser(MultiModalDataParser):
+    def __init__(self) -> None:
+        # Enable parsing video metadata (e.g., temporal_ids) without breaking HF inputs
+        super().__init__(video_needs_metadata=True)
+
     def _parse_image_data(
         self,
         data: dict[str, torch.Tensor] | ModalityData[ImageItem],
@@ -531,7 +572,10 @@ class MiniCPMVMultiModalDataParser(MultiModalDataParser):
                 fields_factory=_minicpmv_field_config,
             )
 
-        return super()._parse_video_data(data)
+        parsed = super()._parse_video_data(data)
+        if parsed is None:
+            return None        
+        return MiniCPMVVideoProcessorItems(parsed.data, parsed.metadata)
 
 
 class MiniCPMVProcessingInfo(BaseProcessingInfo):
@@ -792,21 +836,24 @@ class MiniCPMVMultiModalProcessor(BaseMultiModalProcessor[_I]):
     ) -> Mapping[str, NestedTensors]:
         if (videos := mm_data.get("videos")) is None:
             return {}
-
-        parsed_videos = (
-            self._get_data_parser()
-            .parse_mm_data({"video": videos})
-            .get_items("video", (MiniCPMVVideoEmbeddingItems, VideoProcessorItems))
-        )
-
+        parsed_videos = (self._get_data_parser().parse_mm_data({
+            "video": videos
+        }).get_items("video",
+                     (MiniCPMVVideoEmbeddingItems, MiniCPMVVideoProcessorItems)))
         if isinstance(parsed_videos, MiniCPMVVideoEmbeddingItems):
             video_inputs = {}
         else:
+            # When metadata is enabled, each item may be a tuple (frames, metadata).
+            # Strip metadata before passing to HF, and compute prompts from frames only.
+            images_only = [
+                (video_item[0] if isinstance(video_item, tuple) else video_item)
+                for video_item in parsed_videos
+            ]
             video_inputs = self._base_call_hf_processor(
                 prompts=[
-                    self.info.image_pattern * len(video) for video in parsed_videos
-                ],
-                mm_data={"images": list(parsed_videos)},
+                    self.info.image_pattern * len(frames)
+                         for frames in images_only],
+                mm_data={"images": images_only},
                 mm_kwargs={
                     **mm_kwargs,
                     "max_slice_nums": self.info.get_video_max_slice_num(),
@@ -815,8 +862,22 @@ class MiniCPMVMultiModalProcessor(BaseMultiModalProcessor[_I]):
                 out_keys={"pixel_values", "image_sizes", "tgt_sizes"},
             )
 
-        video_inputs = {f"video_{k}": v for k, v in video_inputs.items()}
+            # Direct passthrough of temporal_ids from metadata (if all provided)
+            metadata = getattr(parsed_videos, "metadata", None)
+            if metadata is not None:
+                tids_all: list[object] = []
+                all_present = True
+                for vid_idx in range(len(parsed_videos)):
+                    item_meta = metadata[vid_idx] if vid_idx < len(metadata) else None
+                    tids = item_meta.get("temporal_ids") if isinstance(item_meta, dict) else None
+                    if tids is None:
+                        all_present = False
+                        break
+                    tids_all.append(tids)
 
+                if all_present:
+                    video_inputs["temporal_ids"] = tids_all
+        video_inputs = {f"video_{k}": v for k, v in video_inputs.items()}
         return video_inputs
 
     def process_mm_inputs(
@@ -928,11 +989,9 @@ class MiniCPMVMultiModalProcessor(BaseMultiModalProcessor[_I]):
 
         def get_video_replacement(item_idx: int):
             videos = mm_items.get_items(
-                "video", (MiniCPMVVideoEmbeddingItems, VideoProcessorItems)
-            )
-
+                "video", (MiniCPMVVideoEmbeddingItems, MiniCPMVVideoProcessorItems))
             frame_size = videos.get_frame_size(item_idx)
-            num_frames = videos.get_num_frames(item_idx)
+            num_frames = videos.get_num_chunks(item_idx)
 
             return PromptUpdateDetails.select_text(
                 self.get_video_prompt_texts(frame_size, num_frames),
@@ -1059,6 +1118,7 @@ class MiniCPMVBaseModel(nn.Module, SupportsMultiModal, SupportsPP):
     ) -> MiniCPMVImageInputs | None:
         pixel_values = kwargs.pop("pixel_values", None)
         image_embeds = kwargs.pop("image_embeds", None)
+        temporal_ids = kwargs.pop("temporal_ids", None)        
 
         if pixel_values is None and image_embeds is None:
             return None
@@ -1071,7 +1131,10 @@ class MiniCPMVBaseModel(nn.Module, SupportsMultiModal, SupportsPP):
 
         tgt_sizes = kwargs.pop("tgt_sizes")
 
-        num_slices_flat = torch.tensor([len(ps) for ps in pixel_values])
+        if temporal_ids is not None:
+            num_slices_flat = torch.tensor([len(ps) for ps in temporal_ids])
+        else:
+            num_slices_flat = torch.tensor([len(ps) for ps in pixel_values])
         pixel_values_flat = flatten_bn(pixel_values)
         tgt_sizes_flat = flatten_bn(tgt_sizes, concat=True)
 
@@ -1080,6 +1143,7 @@ class MiniCPMVBaseModel(nn.Module, SupportsMultiModal, SupportsPP):
             pixel_values=pixel_values_flat,
             tgt_sizes=tgt_sizes_flat,
             num_slices=num_slices_flat,
+            temporal_ids=temporal_ids,
         )
 
     def _parse_and_validate_multimodal_inputs(self, **kwargs: object) -> dict:

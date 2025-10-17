@@ -256,6 +256,161 @@ class OpenCVDynamicVideoBackend(OpenCVVideoBackend):
 
         return frames, metadata
 
+@VIDEO_LOADER_REGISTRY.register("enhanced_opencv")
+class High_Refresh_VideoLoader(OpenCVVideoBackend):
+    
+    DOUBLE_FRAME_DURATION : int = 30
+    MAX_NUM_FRAMES : int = 30
+    MAX_NUM_PACKING : int = 3
+    TIME_SCALE : int = 0.1 
+
+    def map_to_nearest_scale(
+            self,
+            values: np.ndarray,
+            scale: np.ndarray) -> np.ndarray:
+        try:
+            from scipy.spatial import cKDTree
+        except ImportError:
+            cKDTree = None
+        # Mapping values to the nearest scale 
+        # (efficient large-scale version)
+        if cKDTree is None:
+            # Fallback method if scipy is not available
+            scale_array = np.asarray(scale)
+            values_array = np.asarray(values)
+            indices = []
+            for value in values_array:
+                distances = np.abs(scale_array - value)
+                indices.append(np.argmin(distances))
+            return scale_array[indices]
+        
+        tree = cKDTree(np.asarray(scale)[:, None])
+        _, indices = tree.query(np.asarray(values)[:, None])
+        return np.asarray(scale)[indices]
+
+    def group_array(self,
+                    arr: np.ndarray,
+                    size: int):
+        return [arr[i:i+size] 
+                for i in range(0, len(arr), size)]
+
+
+    def uniform_sample(
+                    self,
+                    l : int,
+                    n : int) -> list[int]:
+        gap = l / n
+        return [int(i * gap + gap / 2) for i in range(n)]
+
+
+    @classmethod
+    def load_bytes(cls,
+                   data: bytes,
+                   num_frames: int = -1,
+                   **kwargs,
+                   ) -> tuple[npt.NDArray, dict[str, Any]]:
+        choose_fps = kwargs.get('choose_fps', None)
+        import cv2
+        from io import BytesIO
+        packing_nums : int = 1
+
+        backend = cls().get_cv2_video_api()
+        cap = cv2.VideoCapture(BytesIO(data), backend, [])
+        if not cap.isOpened():
+            raise ValueError("Could not open video stream")
+
+        total_frames_num = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        original_fps = cap.get(cv2.CAP_PROP_FPS)
+        duration = total_frames_num / original_fps if original_fps > 0 else 0
+
+        # Compatible with Common Sampling Parameters
+        if choose_fps and original_fps > 0:
+            if duration < cls().DOUBLE_FRAME_DURATION and choose_fps <=5:
+                choose_fps = choose_fps * 2
+                packing_nums = 2
+                choose_frames_nums = round(
+                    min(choose_fps, round(original_fps)) *
+                    min(cls().MAX_NUM_FRAMES, duration)
+                )
+                choose_frames_nums = min(
+                    choose_frames_nums,
+                    round(cls().MAX_NUM_FRAMES * cls().MAX_NUM_PACKING)
+                )
+            elif choose_fps * int(duration) <= cls().MAX_NUM_FRAMES: # 40
+                packing_nums = 1
+                choose_frames_nums = round(
+                    min(choose_fps, round(original_fps)) *
+                    min(cls().MAX_NUM_FRAMES, duration)
+                )
+            else:
+                packing_nums = math.ceil(
+                    duration * choose_fps / cls().MAX_NUM_FRAMES
+                )
+                if packing_nums <= cls().MAX_NUM_PACKING:
+                    choose_frames_nums = round(duration * choose_fps)
+                else:
+                    choose_frames_nums = round(
+                        cls().MAX_NUM_FRAMES * cls().MAX_NUM_PACKING
+                        )
+                    packing_nums = cls().MAX_NUM_PACKING
+            if total_frames_num < choose_frames_nums :
+                choose_frames_nums = total_frames_num
+            frame_idx = cls().uniform_sample(
+                total_frames_num, choose_frames_nums
+            )
+        else:
+            full_read = num_frames == -1 or total_frames_num < num_frames
+            if full_read:
+                num_frames = total_frames_num
+                frame_idx = list(range(0, num_frames))
+            else:
+                uniform_sampled_frames = np.linspace(
+                    0, total_frames_num - 1, num_frames, dtype=int
+                )
+                frame_idx = uniform_sampled_frames.tolist()
+
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        frames = np.empty((len(frame_idx), height, width, 3), dtype=np.uint8)
+
+        i = 0
+        for idx in range(total_frames_num):
+            ok = cap.grab()
+            if not ok:
+                break
+            if idx in frame_idx:
+                ret, frame = cap.retrieve()
+                if ret:
+                    frames[i] = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    i += 1
+
+        assert i == len(frame_idx), (f"Expected reading {len(frame_idx)} frames, "
+                                 f"but only loaded {i} frames from video.")
+        
+        
+        # Generate temporal_ids for each video
+        # Extract fps from video metadata or use default
+        frame_idx_ts = np.array(frame_idx) / original_fps
+        scale = np.arange(0, duration, cls().TIME_SCALE)
+
+        frame_ts_id = cls().map_to_nearest_scale(
+            frame_idx_ts, scale
+        ) / cls().TIME_SCALE
+        frame_ts_id = frame_ts_id.astype(np.int32)
+        frame_ts_id_group = cls().group_array(frame_ts_id, packing_nums)
+        frame_ts_id_group = [group.tolist() for group in frame_ts_id_group]
+        
+        # Use transformers transformers.video_utils.VideoMetadata format
+        metadata = {
+            "total_num_frames": total_frames_num,
+            "fps": original_fps,
+            "duration": duration,
+            "video_backend": "enhanced_opencv",
+            "temporal_ids": frame_ts_id_group
+        }
+
+        return frames, metadata
+
 
 class VideoMediaIO(MediaIO[npt.NDArray]):
     def __init__(

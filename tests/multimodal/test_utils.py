@@ -206,6 +206,32 @@ async def test_fetch_video_http(video_url: str, num_frames: int):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("video_url", TEST_VIDEO_URLS)
+@pytest.mark.parametrize("choose_fps", [1, 5, 10, 15])
+async def test_fetch_video_http_with_enhanced_opencv_loader(
+    video_url: str,
+    choose_fps: int,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    with monkeypatch.context() as m:
+        m.setenv("VLLM_VIDEO_LOADER_BACKEND", "enhanced_opencv")
+        connector = MediaConnector(
+            media_io_kwargs={
+                "video": {
+                    "choose_fps": choose_fps,
+                }
+            }
+        )
+
+        video_sync, metadata_sync = connector.fetch_video(video_url)
+        video_async, metadata_async = await connector.fetch_video_async(video_url)
+
+        assert np.array_equal(video_sync, video_async)
+        assert metadata_sync == metadata_async
+        assert metadata_sync["video_backend"] == "enhanced_opencv"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("video_url", TEST_VIDEO_URLS)
 @pytest.mark.parametrize("max_duration", [1, 60, 1800])
 @pytest.mark.parametrize("requested_fps", [2, 24])
 async def test_fetch_video_http_with_dynamic_loader(
