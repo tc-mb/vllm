@@ -87,6 +87,7 @@ from vllm.multimodal.profiling import BaseDummyInputsBuilder
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.collection_utils import flatten_2d_lists
+from vllm.utils.import_utils import LazyLoader
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 from vllm.utils.torch_utils import set_default_torch_dtype
 if TYPE_CHECKING:
