@@ -1048,6 +1048,22 @@ class OpenAIServing:
     ]:
         model_config = self.model_config
 
+        # Pass the choose_fps parameter from the openai request to media_io_kwargs
+        # dynamically modify the choose_fps parameter
+        if (
+            envs.VLLM_VIDEO_LOADER_BACKEND == 'enhanced_opencv'
+            and getattr(request, 'mm_processor_kwargs', None)
+        ):
+            choose_fps = request.mm_processor_kwargs.get('choose_fps')
+            if choose_fps is not None:
+                mm_cfg = getattr(model_config, 'multimodal_config', None)
+                if mm_cfg is not None:
+                    if not getattr(mm_cfg, 'media_io_kwargs', None):
+                        mm_cfg.media_io_kwargs = {}
+                    mm_cfg.media_io_kwargs.setdefault('video', {})
+                    
+                    mm_cfg.media_io_kwargs['video']['choose_fps'] = choose_fps
+
         resolved_content_format = resolve_chat_template_content_format(
             chat_template,
             tool_dicts,
