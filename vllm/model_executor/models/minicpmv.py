@@ -579,7 +579,15 @@ class MiniCPMVProcessingInfo(BaseProcessingInfo):
         version = self.get_model_version()
 
         if version == (2, 0) or version == (2, 5):
-            return image_processor.get_slice_image_placeholder(image_size)
+            try:
+                return image_processor.get_slice_image_placeholder(
+                    image_size,
+                    image_idx=image_idx,
+                    max_slice_nums=max_slice_nums,
+                    use_image_id=use_image_id,
+                )
+            except TypeError:
+                return image_processor.get_slice_image_placeholder(image_size)
 
         return image_processor.get_slice_image_placeholder(
             image_size,
@@ -596,17 +604,32 @@ class MiniCPMVProcessingInfo(BaseProcessingInfo):
     ) -> tuple[int, int] | None:
         image_processor = self.get_image_processor()
         version = self.get_model_version()
-
-        if version == (2, 0) or version == (2, 5):
-            return image_processor.get_sliced_grid(image_size)
-
         if max_slice_nums is None:
-            max_slice_nums = image_processor.max_slice_nums
+            max_slice_nums = getattr(image_processor, "max_slice_nums", None)
 
-        return image_processor.get_sliced_grid(
-            image_size,
-            max_slice_nums=max_slice_nums,
-        )
+        if max_slice_nums is not None and version not in {(2, 0), (2, 5)}:
+            try:
+                return image_processor.get_sliced_grid(
+                    image_size,
+                    max_slice_nums=max_slice_nums,
+                )
+            except TypeError:
+                pass
+        elif version in {(2, 0), (2, 5)}:
+         
+            try:
+                return image_processor.get_sliced_grid(image_size)
+            except TypeError:
+                if max_slice_nums is not None:
+                    try:
+                        return image_processor.get_sliced_grid(
+                            image_size,
+                            max_slice_nums=max_slice_nums,
+                        )
+                    except TypeError:
+                        pass
+
+        return image_processor.get_sliced_grid(image_size)
 
     def get_num_image_tokens(
         self,
@@ -859,6 +882,8 @@ class MiniCPMVMultiModalProcessor(BaseMultiModalProcessor[_I]):
                 )
 
                 for k, v in inputs_one.items():
+                    if k not in out_keys:
+                        continue
                     assert len(v) == 1, (k, len(v))
                     inputs[k].append(v[0])
 
