@@ -579,6 +579,7 @@ class MiniCPMVProcessingInfo(BaseProcessingInfo):
         version = self.get_model_version()
 
         if version == (2, 0) or version == (2, 5):
+           
             try:
                 return image_processor.get_slice_image_placeholder(
                     image_size,
@@ -603,31 +604,18 @@ class MiniCPMVProcessingInfo(BaseProcessingInfo):
         max_slice_nums: int | None = None,
     ) -> tuple[int, int] | None:
         image_processor = self.get_image_processor()
-        version = self.get_model_version()
         if max_slice_nums is None:
             max_slice_nums = getattr(image_processor, "max_slice_nums", None)
 
-        if max_slice_nums is not None and version not in {(2, 0), (2, 5)}:
+        
+        if max_slice_nums is not None:
             try:
                 return image_processor.get_sliced_grid(
-                    image_size,
-                    max_slice_nums=max_slice_nums,
-                )
+            image_size,
+            max_slice_nums=max_slice_nums,
+        )
             except TypeError:
                 pass
-        elif version in {(2, 0), (2, 5)}:
-         
-            try:
-                return image_processor.get_sliced_grid(image_size)
-            except TypeError:
-                if max_slice_nums is not None:
-                    try:
-                        return image_processor.get_sliced_grid(
-                            image_size,
-                            max_slice_nums=max_slice_nums,
-                        )
-                    except TypeError:
-                        pass
 
         return image_processor.get_sliced_grid(image_size)
 

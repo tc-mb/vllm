@@ -24,6 +24,7 @@
 # limitations under the License.
 """Inference-only MiniCPM-O model compatible with HuggingFace weights."""
 
+import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Annotated, Any, Literal, TypeAlias
 
@@ -186,11 +187,56 @@ class MiniCPMOProcessingInfo(MiniCPMVProcessingInfo):
     ) -> str:
         hf_processor = self.get_hf_processor()
 
-        return hf_processor.get_audio_placeholder(
+        
+        if hasattr(hf_processor, "get_audio_placeholder"):
+            return hf_processor.get_audio_placeholder(
             audio_lens,
             chunk_input=chunk_input,
             chunk_length=chunk_length,
         )
+
+        
+        pool_step = getattr(hf_processor, "pool_step", None)
+        audio_processor = getattr(hf_processor, "audio_processor", None)
+        tokenizer = getattr(hf_processor, "tokenizer", None)
+        hop_length = getattr(audio_processor, "hop_length", None)
+        audio_start = getattr(tokenizer, "audio_start", None)
+        audio_end = getattr(tokenizer, "audio_end", None)
+
+        if None in (pool_step, hop_length, audio_start, audio_end):
+            raise AttributeError(
+                "MiniCPMOProcessor missing get_audio_placeholder and required "
+                "attrs (pool_step/audio_processor.hop_length/tokenizer.audio_start/"
+                "tokenizer.audio_end) for placeholder fallback."
+            )
+
+        pool_step = int(pool_step)
+        hop_length = int(hop_length)
+
+        feature_lens = math.ceil(audio_lens / hop_length)
+        feature_lens = (feature_lens - 1) // 2 + 1
+        output_lens = (feature_lens - pool_step) // pool_step + 1
+        if output_lens < 1:
+            output_lens = 1
+
+        if chunk_input:
+            fbank_feat_in_chunk = int(chunk_length * 100)
+            cnn_feat_in_chunk = (fbank_feat_in_chunk - 1) // 2 + 1
+            audio_embeds_in_chunk = (cnn_feat_in_chunk - pool_step) // pool_step + 1
+            if audio_embeds_in_chunk < 1:
+                audio_embeds_in_chunk = 1
+
+            num_audio_chunks = (output_lens + audio_embeds_in_chunk -
+                                1) // audio_embeds_in_chunk
+            place_holders = ""
+            total_unk_len = 0
+            for _ in range(num_audio_chunks):
+                unk_len = min(audio_embeds_in_chunk, output_lens - total_unk_len)
+                place_holders += audio_start + "<unk>" * unk_len + audio_end
+                total_unk_len += unk_len
+            return place_holders
+
+        return audio_start + "<unk>" * output_lens + audio_end
 
     def get_default_audio_pool_step(self) -> int:
         hf_config = self.get_hf_config()
