@@ -11,6 +11,8 @@ from PIL import Image as PILImage
 from torch import nn
 from transformers import MiniCPMV4_6Config
 
+from vllm.logger import init_logger
+
 from vllm.config import VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import get_act_fn
@@ -70,6 +72,8 @@ from .utils import (
     maybe_prefix,
 )
 from .vision import is_vit_use_data_parallel
+
+logger = init_logger(__name__)
 
 
 def _minicpmv4_6_field_config(hf_inputs: Mapping[str, torch.Tensor]):
@@ -975,20 +979,123 @@ class MiniCPMV4_6ForConditionalGeneration(
             return "<|video_pad|>"
         raise ValueError("Only image or video modality is supported")
 
+    def _init_canvas_mrope(self, vllm_config: VllmConfig) -> None:
+        """Resolve special token IDs for canvas M-RoPE from the tokenizer."""
+        config = self.config
+        uses_canvas = getattr(config, "uses_mrope_canvas", False)
+        if not uses_canvas:
+            mrope_mode = getattr(config, "mrope_mode", None)
+            if mrope_mode is not None and "canvas" in str(mrope_mode).lower():
+                uses_canvas = True
+
+        self._uses_canvas_mrope = uses_canvas
+        if not uses_canvas:
+            self._canvas_special_ids = None
+            return
+
+        try:
+            try:
+                from vllm.tokenizers.registry import get_tokenizer
+            except ImportError:
+                from vllm.transformers_utils.tokenizer import get_tokenizer
+
+            model_config = vllm_config.model_config
+            tokenizer = get_tokenizer(
+                model_config.tokenizer,
+                tokenizer_revision=model_config.tokenizer_revision,
+                trust_remote_code=model_config.trust_remote_code,
+            )
+            self._canvas_special_ids = {
+                "im_start_id": tokenizer.convert_tokens_to_ids(
+                    getattr(tokenizer, "image_start_token", "<image>")
+                ),
+                "im_end_id": tokenizer.convert_tokens_to_ids(
+                    getattr(tokenizer, "image_end_token", "</image>")
+                ),
+                "slice_start_id": tokenizer.convert_tokens_to_ids(
+                    getattr(tokenizer, "slice_start_token", "<slice>")
+                ),
+                "slice_end_id": tokenizer.convert_tokens_to_ids(
+                    getattr(tokenizer, "slice_end_token", "</slice>")
+                ),
+                "newline_id": tokenizer.encode(
+                    "\n", add_special_tokens=False
+                )[0],
+            }
+            logger.info(
+                "Canvas M-RoPE enabled with special_token_ids=%s",
+                self._canvas_special_ids,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to resolve canvas M-RoPE token IDs; "
+                "falling back to 1D sequential positions.",
+                exc_info=True,
+            )
+            self._uses_canvas_mrope = False
+            self._canvas_special_ids = None
+
     def get_mrope_input_positions(
         self,
         input_tokens: list[int],
         mm_features: list["MultiModalFeatureSpec"],
     ) -> tuple[torch.Tensor, int]:
-        """MiniCPM-V uses embedding injection for vision, not spatial M-RoPE.
+        """Compute M-RoPE input positions for MiniCPM-V 4.6.
 
-        All tokens (text and vision placeholders) get identical sequential
-        positions duplicated across the 3 M-RoPE channels expected by the
-        Qwen3.5 backbone.
+        When canvas M-RoPE is enabled (config.uses_mrope_canvas or
+        config.mrope_mode contains "canvas"), visual tokens receive spatial 2D
+        positions matching the transformers trust_remote_code implementation.
+        Otherwise, all tokens get identical 1D sequential positions across the
+        3 M-RoPE channels.
         """
         seq_len = len(input_tokens)
-        positions = torch.arange(seq_len).unsqueeze(0).expand(3, -1)
-        return positions, 0
+
+        if (
+            not self._uses_canvas_mrope
+            or self._canvas_special_ids is None
+            or not mm_features
+        ):
+            positions = torch.arange(seq_len).unsqueeze(0).expand(3, -1)
+            return positions, 0
+
+        from .mrope_minicpmv4_6 import (
+            _compute_canvas_single,
+            build_image_bounds,
+        )
+
+        input_ids = torch.tensor(input_tokens, dtype=torch.long)
+        image_bounds = build_image_bounds(input_ids, self._canvas_special_ids)
+
+        target_sizes_list: list[torch.Tensor] = []
+        for mm_feature in sorted(
+            mm_features, key=lambda f: f.mm_position.offset
+        ):
+            if mm_feature.data is None:
+                continue
+            tgt = mm_feature.data.get("tgt_sizes")
+            if tgt is not None and tgt.data is not None:
+                target_sizes_list.append(tgt.data.to(torch.long))
+            vtgt = mm_feature.data.get("video_tgt_sizes")
+            if vtgt is not None and vtgt.data is not None:
+                target_sizes_list.append(vtgt.data.to(torch.long))
+
+        if not target_sizes_list or image_bounds.numel() == 0:
+            positions = torch.arange(seq_len).unsqueeze(0).expand(3, -1)
+            return positions, 0
+
+        target_sizes = torch.cat(target_sizes_list, dim=0)
+        position_ids_2d = torch.arange(seq_len, dtype=torch.long)
+
+        pos3d = _compute_canvas_single(
+            input_ids,
+            position_ids_2d,
+            image_bounds,
+            target_sizes,
+            self._canvas_special_ids,
+        )
+
+        delta = (pos3d.max().item() - seq_len)
+        return pos3d, delta
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -999,6 +1106,8 @@ class MiniCPMV4_6ForConditionalGeneration(
         self.config = config
         self.multimodal_config = multimodal_config
         self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
+
+        self._init_canvas_mrope(vllm_config)
 
         # --- Vision tower ---
         with self._mark_tower_model(vllm_config, {"image"}):
