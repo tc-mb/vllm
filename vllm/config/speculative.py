@@ -523,6 +523,17 @@ class SpeculativeConfig:
                     "architectures": ["Qwen3_5MoeMTP" if is_moe else "Qwen3_5MTP"],
                 }
             )
+        if hf_config.model_type == "minicpmv4_6":
+            text_cfg = getattr(hf_config, "text_config", hf_config)
+            is_moe = getattr(text_cfg, "model_type", None) == "qwen3_5_moe_text"
+            n_predict = getattr(text_cfg, "mtp_num_hidden_layers", None)
+            hf_config.model_type = "qwen3_5_mtp"
+            hf_config.update(
+                {
+                    "n_predict": n_predict,
+                    "architectures": ["Qwen3_5MoeMTP" if is_moe else "Qwen3_5MTP"],
+                }
+            )
         if hf_config.model_type in ("longcat_flash", "longcat_flash_ngram"):
             hf_config.model_type = "longcat_flash_mtp"
             n_predict = getattr(hf_config, "num_nextn_predict_layers", 1)

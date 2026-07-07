@@ -46,6 +46,13 @@ class CompletionOutput:
     finish_reason: str | None = None
     stop_reason: int | str | None = None
     lora_request: LoRARequest | None = None
+    # Speculative decoding: how many tokens in token_ids (this delta) were
+    # draft-accepted; tokens[num_spec_accepted:] are verified/bonus.
+    num_spec_accepted: int = 0
+    # Per-token provenance mask: True = draft-accepted, False = verified.
+    # In DELTA mode, covers only the current delta's tokens.
+    # In FINAL_ONLY mode, covers all output tokens.
+    spec_token_mask: list[bool] | None = None
 
     def finished(self) -> bool:
         return self.finish_reason is not None

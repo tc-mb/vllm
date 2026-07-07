@@ -189,6 +189,9 @@ class RequestState:
             deque() if stream_input else None
         )
 
+        # Per-token speculative decode provenance (True = draft-accepted)
+        self._spec_token_mask: list[bool] = []
+
     def apply_streaming_update(self, update: StreamingUpdate) -> None:
         # Apply the update to the request state.
         self.streaming_input = not update.final
@@ -278,7 +281,20 @@ class RequestState:
         stop_reason: int | str | None,
         kv_transfer_params: dict[str, Any] | None = None,
         ec_transfer_params: dict[str, Any] | None = None,
+        num_spec_accepted: int = 0,
+        spec_decode_active: bool = False,
     ) -> RequestOutput | PoolingRequestOutput | None:
+        # Accumulate per-token spec decode provenance across all steps.
+        if spec_decode_active or self._spec_token_mask:
+            if not self._spec_token_mask and self.detokenizer is not None:
+                prior = (
+                    self.detokenizer.num_output_tokens() - len(new_token_ids)
+                )
+                if prior > 0:
+                    self._spec_token_mask.extend([False] * prior)
+            for i in range(len(new_token_ids)):
+                self._spec_token_mask.append(i < num_spec_accepted)
+
         finished = finish_reason is not None
         final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
 
@@ -318,7 +334,9 @@ class RequestState:
                 finished,
             )
 
-        output = self._new_completion_output(new_token_ids, finish_reason, stop_reason)
+        output = self._new_completion_output(
+            new_token_ids, finish_reason, stop_reason, num_spec_accepted
+        )
 
         if self.parent_req is None:
             outputs = [output]
@@ -387,6 +405,7 @@ class RequestState:
         token_ids: list[int],
         finish_reason: FinishReason | None,
         stop_reason: int | str | None,
+        num_spec_accepted: int = 0,
     ) -> CompletionOutput:
         assert self.detokenizer is not None
         assert self.logprobs_processor is not None
@@ -408,6 +427,13 @@ class RequestState:
         if finished and self.routed_experts_chunks:
             routed_experts = np.concatenate(self.routed_experts_chunks, axis=0)
 
+        spec_token_mask = None
+        if self._spec_token_mask:
+            if delta:
+                spec_token_mask = self._spec_token_mask[-len(token_ids):]
+            else:
+                spec_token_mask = list(self._spec_token_mask[:len(token_ids)])
+
         return CompletionOutput(
             index=self.request_index,
             text=text,
@@ -417,6 +443,8 @@ class RequestState:
             cumulative_logprob=self.logprobs_processor.cumulative_logprob,
             finish_reason=str(finish_reason) if finished else None,
             stop_reason=stop_reason if finished else None,
+            num_spec_accepted=num_spec_accepted,
+            spec_token_mask=spec_token_mask,
         )
 
     def _new_pooling_output(self, pooling_output: torch.Tensor) -> PoolingOutput:
@@ -669,6 +697,8 @@ class OutputProcessor:
                 stop_reason,
                 kv_transfer_params,
                 ec_transfer_params,
+                engine_core_output.num_spec_accepted,
+                engine_core_output.spec_decode_active,
             ):
                 if req_state.streaming_input:
                     request_output.finished = False

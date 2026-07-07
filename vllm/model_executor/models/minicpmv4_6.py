@@ -63,7 +63,7 @@ from .minicpmv import (
     MiniCPMVVideoEmbeddingItems,
 )
 from .module_mapping import MultiModelKeys
-from .qwen3_5 import Qwen3_5ForCausalLM
+from .qwen3_5 import Qwen3_5ForCausalLM, Qwen3_5MoeForCausalLM
 from .utils import (
     AutoWeightsLoader,
     WeightsMapper,
@@ -1131,18 +1131,17 @@ class MiniCPMV4_6ForConditionalGeneration(
             )
 
         # --- Language model ---
-        # Temporarily swap top-level model_type so that Qwen3_5ForCausalLM
-        # picks up the expected text config when introspecting the hf config.
         with self._mark_language_model(vllm_config):
-            saved_model_type = config.model_type
-            config.model_type = "qwen3_5_text"
-            try:
+            if config.text_config.model_type == "qwen3_5_moe_text":
+                self.language_model = Qwen3_5MoeForCausalLM(
+                    vllm_config=vllm_config,
+                    prefix=maybe_prefix(prefix, "language_model"),
+                )
+            else:
                 self.language_model = Qwen3_5ForCausalLM(
                     vllm_config=vllm_config,
                     prefix=maybe_prefix(prefix, "language_model"),
                 )
-            finally:
-                config.model_type = saved_model_type
 
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
