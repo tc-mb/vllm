@@ -653,11 +653,13 @@ class MiniCPMV4_6ProcessingInfo(MiniCPMVProcessingInfo):
 
 
 class MiniCPMV4_6ViTWindowAttentionSelfAttn(nn.Module):
+    # Ordered so that no rule can re-match the "qkv_proj" produced by an
+    # earlier rule ("qkv_proj" contains the substring "v_proj").
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_stacked={
-            "q_proj": ("qkv_proj", "q"),
-            "k_proj": ("qkv_proj", "k"),
             "v_proj": ("qkv_proj", "v"),
+            "k_proj": ("qkv_proj", "k"),
+            "q_proj": ("qkv_proj", "q"),
         }
     )
 
