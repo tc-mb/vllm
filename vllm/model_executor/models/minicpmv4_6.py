@@ -1387,7 +1387,12 @@ class MiniCPMV4_6ForConditionalGeneration(
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
     ) -> set[str]:
-        loader = AutoWeightsLoader(self, skip_prefixes=["mtp."])
+        # Omni checkpoints bundle audio/TTS weights that the image-text
+        # graph does not use; mtp weights are loaded by the draft model.
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=["mtp.", "apm.", "audio_projection_layer.", "tts."],
+        )
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     def get_mm_mapping(self) -> MultiModelKeys:

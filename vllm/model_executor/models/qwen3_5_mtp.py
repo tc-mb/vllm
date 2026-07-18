@@ -291,7 +291,12 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         def remap_weight_names(weights):
+            # Omni checkpoints bundle audio/TTS weights (e.g.
+            # tts.model.embed_tokens) that do not belong to the MTP module.
+            audio_prefixes = ("apm.", "audio_projection_layer.", "tts.")
             for name, weight in weights:
+                if name.startswith(audio_prefixes):
+                    continue
                 if name.startswith("mtp."):
                     name = name.replace("mtp.", "model.")
                 elif any(key in name for key in ["embed_tokens", "lm_head"]):
