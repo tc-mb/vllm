@@ -13,6 +13,7 @@ from vllm.parser.engine.adapters import make_adapters
 from vllm.parser.gemma4 import Gemma4Parser
 from vllm.parser.glm47_moe import Glm47MoeParser
 from vllm.parser.kimi_k2 import KimiK2Parser
+from vllm.parser.minicpmv import MiniCPMVParser
 from vllm.parser.minimax_m2 import MinimaxM2Parser
 from vllm.parser.nemotron_v3 import NemotronV3Parser
 from vllm.parser.qwen3 import Qwen3Parser
@@ -47,6 +48,11 @@ from vllm.parser.seed_oss import SeedOssParser
     Qwen3ParserReasoningAdapter,
     Qwen3ParserToolAdapter,
 ) = make_adapters(Qwen3Parser)
+
+(
+    MiniCPMVParserReasoningAdapter,
+    MiniCPMVParserToolAdapter,
+) = make_adapters(MiniCPMVParser)
 
 (
     SeedOssParserReasoningAdapter,
