@@ -40,6 +40,25 @@ class TestNonThinking:
         assert reasoning is None
         assert content == "The answer is 42."
 
+    def test_reserved_markers_are_removed(self, parser):
+        output = (
+            "<reserved_12>reasoning<reserved_13><|reserved_14|>tool call<|reserved_15|>"
+        )
+
+        reasoning, content = parser.extract_reasoning(output, None)
+
+        assert reasoning is None
+        assert content == "reasoningtool call"
+
+    def test_unrelated_reserved_text_is_unchanged(self, parser):
+        reasoning, content = parser.extract_reasoning(
+            "<reserved_11>content<|reserved_16|>",
+            None,
+        )
+
+        assert reasoning is None
+        assert content == "<reserved_11>content<|reserved_16|>"
+
     def test_dangling_standard_think_end_is_removed(self, parser):
         output = "first part </think>\n\nfinal part"
 
@@ -73,6 +92,22 @@ class TestNonThinking:
         assert reasoning == ""
         assert content == "final answer"
 
+    def test_streaming_split_reserved_markers(self, parser):
+        reasoning, content = simulate_reasoning_streaming(
+            parser,
+            [
+                "<reser",
+                "ved_12>",
+                "reasoning",
+                "<|reserved",
+                "_13|>",
+                "final answer",
+            ],
+        )
+
+        assert reasoning == ""
+        assert content == "reasoningfinal answer"
+
 
 class TestThinking:
     def test_standard_think_tags_are_parsed(self, mock_tokenizer):
@@ -83,6 +118,20 @@ class TestThinking:
 
         reasoning, content = parser.extract_reasoning(
             "<think>private reasoning</think>final answer",
+            None,
+        )
+
+        assert reasoning == "private reasoning"
+        assert content == "final answer"
+
+    def test_reserved_markers_are_removed(self, mock_tokenizer):
+        parser = MiniCPMVParser(
+            mock_tokenizer,
+            chat_template_kwargs={"enable_thinking": True},
+        )
+
+        reasoning, content = parser.extract_reasoning(
+            "<think><reserved_12>private reasoning</think><|reserved_13|>final answer",
             None,
         )
 

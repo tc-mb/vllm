@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Sequence
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from vllm.parser.engine.parser_engine import ParserEngine
@@ -14,7 +15,7 @@ from vllm.parser.engine.parser_engine_config import (
     ParserState,
     Transition,
 )
-from vllm.parser.qwen3 import Qwen3Parser
+from vllm.parser.qwen3 import Qwen3Parser, qwen3_config
 
 if TYPE_CHECKING:
     from vllm.entrypoints.openai.chat_completion.protocol import (
@@ -26,26 +27,54 @@ if TYPE_CHECKING:
     from vllm.tool_parsers.abstract_tool_parser import Tool
 
 
+_RESERVED_MARKER_IDS = range(12, 16)
+
+
 @functools.cache
-def minicpmv_no_thinking_config() -> ParserEngineConfig:
-    return ParserEngineConfig(
-        name="minicpmv_no_thinking",
-        initial_state=ParserState.CONTENT,
-        terminals={
-            "THINK_START": "<think>",
-            "THINK_END": "</think>",
-        },
-        token_id_terminals={
-            "THINK_START": "<think>",
-            "THINK_END": "</think>",
-        },
-        transitions={
-            (ParserState.CONTENT, "THINK_START"): Transition(ParserState.REASONING),
-            (ParserState.REASONING, "THINK_START"): Transition(ParserState.REASONING),
-            (ParserState.REASONING, "THINK_END"): Transition(ParserState.CONTENT),
-            (ParserState.CONTENT, "THINK_END"): Transition(ParserState.CONTENT),
-        },
-        strip_trailing_reasoning_whitespace=False,
+def minicpmv_config(thinking: bool) -> ParserEngineConfig:
+    if thinking:
+        base = qwen3_config(thinking=True, name="minicpmv")
+    else:
+        base = ParserEngineConfig(
+            name="minicpmv_no_thinking",
+            initial_state=ParserState.CONTENT,
+            terminals={
+                "THINK_START": "<think>",
+                "THINK_END": "</think>",
+            },
+            token_id_terminals={
+                "THINK_START": "<think>",
+                "THINK_END": "</think>",
+            },
+            transitions={
+                (ParserState.CONTENT, "THINK_START"): Transition(ParserState.REASONING),
+                (ParserState.REASONING, "THINK_START"): Transition(
+                    ParserState.REASONING
+                ),
+                (ParserState.REASONING, "THINK_END"): Transition(ParserState.CONTENT),
+                (ParserState.CONTENT, "THINK_END"): Transition(ParserState.CONTENT),
+            },
+            strip_trailing_reasoning_whitespace=False,
+        )
+
+    terminals = dict(base.terminals)
+    token_id_terminals = dict(base.token_id_terminals)
+    transitions = dict(base.transitions)
+    for index in _RESERVED_MARKER_IDS:
+        text_name = f"RESERVED_TEXT_{index}"
+        token_name = f"RESERVED_TOKEN_{index}"
+        terminals[text_name] = f"<reserved_{index}>"
+        terminals[token_name] = f"<|reserved_{index}|>"
+        token_id_terminals[token_name] = f"<|reserved_{index}|>"
+        for state in (ParserState.CONTENT, ParserState.REASONING):
+            transitions[(state, text_name)] = Transition(state)
+            transitions[(state, token_name)] = Transition(state)
+
+    return replace(
+        base,
+        terminals=terminals,
+        token_id_terminals=token_id_terminals,
+        transitions=transitions,
     )
 
 
@@ -61,11 +90,8 @@ class MiniCPMVParser(Qwen3Parser):
         **kwargs,
     ) -> None:
         chat_kwargs = kwargs.get("chat_template_kwargs", {}) or {}
-        if not chat_kwargs.get("enable_thinking", False):
-            kwargs.setdefault(
-                "parser_engine_config",
-                minicpmv_no_thinking_config(),
-            )
+        thinking_enabled = chat_kwargs.get("enable_thinking", False)
+        kwargs.setdefault("parser_engine_config", minicpmv_config(thinking_enabled))
         super().__init__(tokenizer, tools, **kwargs)
 
     @property
