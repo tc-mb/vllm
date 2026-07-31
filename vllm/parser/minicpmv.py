@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 
 
 _RESERVED_MARKER_IDS = range(12, 16)
+_IM_END = "<|im_end|>"
 
 
 @functools.cache
@@ -60,6 +61,11 @@ def minicpmv_config(thinking: bool) -> ParserEngineConfig:
     terminals = dict(base.terminals)
     token_id_terminals = dict(base.token_id_terminals)
     transitions = dict(base.transitions)
+    terminals["IM_END"] = _IM_END
+    token_id_terminals["IM_END"] = _IM_END
+    for state in (ParserState.CONTENT, ParserState.REASONING):
+        transitions[(state, "IM_END")] = Transition(state)
+
     for index in _RESERVED_MARKER_IDS:
         text_name = f"RESERVED_TEXT_{index}"
         token_name = f"RESERVED_TOKEN_{index}"

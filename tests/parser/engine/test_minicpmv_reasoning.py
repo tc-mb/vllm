@@ -12,6 +12,7 @@ from vllm.reasoning import ReasoningParserManager
 _VOCAB = {
     "<think>": 10,
     "</think>": 11,
+    "<|im_end|>": 12,
 }
 
 
@@ -137,3 +138,18 @@ class TestThinking:
 
         assert reasoning == "private reasoning"
         assert content == "final answer"
+
+    def test_streaming_im_end_is_removed(self):
+        tokenizer = make_mock_tokenizer(_VOCAB, special_tokens=[])
+        parser = MiniCPMVParser(
+            tokenizer,
+            chat_template_kwargs={"enable_thinking": True},
+        )
+
+        reasoning, content = simulate_reasoning_streaming(
+            parser,
+            ["Answer: 111", "<|im_end|>"],
+        )
+
+        assert reasoning == "Answer: 111"
+        assert content == ""
