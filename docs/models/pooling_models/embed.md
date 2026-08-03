@@ -39,12 +39,13 @@ You can compute pairwise similarity scores to build a similarity matrix using th
 | ------------ | ------ | ----------------- | ------------------------------ | ------------------------------------------ |
 | `BertModel` | BERT-based | `BAAI/bge-base-en-v1.5`, `Snowflake/snowflake-arctic-embed-xs`, etc. | | |
 | `BertSpladeSparseEmbeddingModel` | SPLADE | `naver/splade-v3` | | |
+| `BgeM3EmbeddingModel` | BGE-M3 | `BAAI/bge-m3` | | |
 | `Gemma2Model`<sup>C</sup> | Gemma 2-based | `BAAI/bge-multilingual-gemma2`, etc. | ✅︎ | ✅︎ |
 | `Gemma3TextModel`<sup>C</sup> | Gemma 3-based | `google/embeddinggemma-300m`, etc. | ✅︎ | ✅︎ |
 | `GritLM` | GritLM | `parasail-ai/GritLM-7B-vllm`. | ✅︎ | ✅︎ |
 | `GteModel` | Arctic-Embed-2.0-M | `Snowflake/snowflake-arctic-embed-m-v2.0`. | | |
 | `GteNewModel` | mGTE-TRM (see note) | `Alibaba-NLP/gte-multilingual-base`, etc. | | |
-| `JinaEmbeddingsV5Model`<sup>C</sup> | Qwen3-based with task-specific LoRA adapters | `jinaai/jina-embeddings-v5-text-small` (see note) | ✅︎ | ✅︎ |
+| `JinaEmbeddingsV5Model`<sup>C</sup> | Qwen3-decoder or EuroBERT-encoder backbone with task-specific LoRA adapters | `jinaai/jina-embeddings-v5-text-small`, `jinaai/jina-embeddings-v5-text-nano` (see note) | ✅︎ | ✅︎ |
 | `LlamaBidirectionalModel`<sup>C</sup> | Llama-based with bidirectional attention | `nvidia/llama-nemotron-embed-1b-v2`, etc. | ✅︎ | ✅︎ |
 | `LlamaModel`<sup>C</sup>, `LlamaForCausalLM`<sup>C</sup>, `MistralModel`<sup>C</sup>, etc. | Llama-based | `intfloat/e5-mistral-7b-instruct`, etc. | ✅︎ | ✅︎ |
 | `ModernBertModel` | ModernBERT-based | `Alibaba-NLP/gte-modernbert-base`, etc. | | |
@@ -74,7 +75,9 @@ You can compute pairwise similarity scores to build a similarity matrix using th
     `jinaai/jina-embeddings-v3` supports multiple tasks through LoRA, while vllm temporarily only supports text-matching tasks by merging LoRA weights.
 
 !!! note
-    `jinaai/jina-embeddings-v5-text-small` ships with four task-specific LoRA adapters
+    `jinaai/jina-embeddings-v5-text-small` (Qwen3 decoder) and
+    `jinaai/jina-embeddings-v5-text-nano` (bidirectional EuroBERT encoder,
+    `is_decoder=false`) ship with four task-specific LoRA adapters
     (`retrieval`, `text-matching`, `classification`, `clustering`). vLLM merges the
     selected adapter into the base weights at load time. Choose the task with
     `--hf-overrides '{"jina_task": "<task>"}'`; the default is `retrieval`.
@@ -89,6 +92,7 @@ You can compute pairwise similarity scores to build a similarity matrix using th
 | `CLIPModel` | CLIP | T / I | `openai/clip-vit-base-patch32`, `openai/clip-vit-large-patch14`, etc. | | |
 | `LlamaNemotronVLModel` | Llama Nemotron Embedding + SigLIP | T + I | `nvidia/llama-nemotron-embed-vl-1b-v2` | | |
 | `LlavaNextForConditionalGeneration`<sup>C</sup> | LLaVA-NeXT-based | T / I | `royokong/e5-v` | | ✅︎ |
+| `MiniCPMRobotForHiddenStates` | MiniCPM-Robot | T + I<sup>E+</sup> | N/A | | |
 | `Phi3VForCausalLM`<sup>C</sup> | Phi-3-Vision-based | T + I | `TIGER-Lab/VLM2Vec-Full` | | ✅︎ |
 | `Qwen3VLForConditionalGeneration`<sup>C</sup> (see note) | Qwen3-VL | T + I + V | `Qwen/Qwen3-VL-Embedding-2B`, etc. | ✅︎ | ✅︎ |
 | `SiglipModel` | SigLIP, SigLIP2 | T / I | `google/siglip-base-patch16-224`, `google/siglip2-base-patch16-224` | | |
@@ -96,6 +100,15 @@ You can compute pairwise similarity scores to build a similarity matrix using th
 
 <sup>C</sup> Automatically converted into an embedding model via `--convert embed`. ([details](./README.md#model-conversion))  
 \* Feature support is the same as that of the original model.
+
+!!! note
+    `MiniCPMRobotForHiddenStates` outputs actions (not embeddings).
+    It requires `action_head_cfg` in the model config (set via
+    `--hf-overrides`). Robot state must be passed per-request via
+    `PoolingParams.extra_kwargs["robot_state"]`.     A fused checkpoint containing both VLM and ActionHead weights
+    (under the ``pooler.action_head.`` prefix in the safetensors file)
+    is required. Set ``action_head_cfg`` via ``--hf-overrides`` to
+    configure ``action_dim``, ``state_dim``, ``action_horizon``.
 
 If your model is not in the above list, we will try to automatically convert the model using
 [as_embedding_model][vllm.model_executor.models.adapters.as_embedding_model]. By default, the embeddings
