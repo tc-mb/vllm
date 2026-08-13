@@ -138,6 +138,84 @@ def _get_audio_config(hf_config: MiniCPMV4_6Config) -> WhisperConfig:
     )
 
 
+def _get_text_config(hf_config: MiniCPMV4_6Config):
+    text_config = getattr(hf_config, "text_config", None)
+    return text_config if text_config is not None else hf_config
+
+
+def _get_text_model_type(hf_config: MiniCPMV4_6Config) -> str:
+    text_config = _get_text_config(hf_config)
+    return getattr(hf_config, "text_model_type", text_config.model_type)
+
+
+def _normalize_text_config(hf_config: MiniCPMV4_6Config):
+    text_config = _get_text_config(hf_config)
+    if text_config is hf_config:
+        text_config.model_type = _get_text_model_type(hf_config)
+    return text_config
+
+
+def _get_image_slices(
+    processor_output: Mapping[str, Any],
+    patch_size: int,
+) -> tuple[list[torch.Tensor], torch.Tensor]:
+    pixel_values = processor_output["pixel_values"]
+    target_sizes = processor_output.get("target_sizes")
+    if target_sizes is None:
+        target_sizes = processor_output["tgt_sizes"]
+
+    if isinstance(pixel_values, list):
+        if len(pixel_values) == 1 and isinstance(pixel_values[0], list):
+            pixel_values = pixel_values[0]
+        if isinstance(target_sizes, list) and len(target_sizes) == 1:
+            target_sizes = target_sizes[0]
+        return (
+            [torch.as_tensor(item) for item in pixel_values],
+            torch.as_tensor(target_sizes, dtype=torch.long),
+        )
+
+    if pixel_values.ndim == 4 and pixel_values.shape[0] == 1:
+        pixel_values = pixel_values.squeeze(0)
+    target_sizes = target_sizes.to(torch.long)
+    split_widths = (target_sizes[:, 0] * target_sizes[:, 1] * patch_size).tolist()
+    return list(torch.split(pixel_values, split_widths, dim=-1)), target_sizes
+
+
+def _get_sliced_grid(
+    image_processor,
+    image_size: tuple[int, int],
+    max_slice_nums: int,
+    scale_resolution: int,
+):
+    try:
+        return image_processor.get_sliced_grid(
+            image_size,
+            max_slice_nums,
+            scale_resolution=scale_resolution,
+        )
+    except TypeError:
+        return image_processor.get_sliced_grid(
+            image_size,
+            max_slice_nums,
+        )
+
+
+def _get_image_embed_token_id(tokenizer, image_processor) -> int:
+    if hasattr(image_processor, "get_slice_image_placeholder"):
+        image_embed_text = tokenizer.unk_token
+    else:
+        image_embed_text = getattr(tokenizer, "image_token", "<|image_pad|>")
+    image_embed_token_ids = tokenizer.encode(
+        image_embed_text,
+        add_special_tokens=False,
+    )
+    if len(image_embed_token_ids) != 1:
+        raise ValueError(
+            f"Expected one image embedding token, got {image_embed_token_ids}"
+        )
+    return image_embed_token_ids[0]
+
+
 def _minicpmv4_6_field_config(hf_inputs: Mapping[str, torch.Tensor]):
     fields = dict(
         pixel_values=MultiModalFieldConfig.batched("image"),
@@ -267,22 +345,16 @@ class MiniCPMV4_6MultiModalProcessor(MiniCPMVMultiModalProcessor):
         per_image_tgt_sizes: list[torch.Tensor] = []
         for image in parsed_images:
             ip_out = image_processor([image], **mm_kwargs)
-            pv = ip_out["pixel_values"]  # (1, C, P, sum_W)
-            ts = ip_out["target_sizes"]  # (n_slices, 2)
-            if pv.ndim == 4 and pv.shape[0] == 1:
-                pv = pv.squeeze(0)  # (C, P, sum_W)
-            ts_long = ts.to(torch.long)
-            split_widths = (ts_long[:, 0] * ts_long[:, 1] * patch_size).tolist()
-            slices = torch.split(pv, split_widths, dim=-1)
+            slices, ts_long = _get_image_slices(ip_out, patch_size)
             n_slices = len(slices)
             l_max = max(s.shape[-1] for s in slices)
             out = torch.zeros(
                 n_slices,
-                pv.shape[0],
-                pv.shape[1],
+                slices[0].shape[0],
+                slices[0].shape[1],
                 l_max,
-                dtype=pv.dtype,
-                device=pv.device,
+                dtype=slices[0].dtype,
+                device=slices[0].device,
             )
             for i, s in enumerate(slices):
                 out[i, :, :, : s.shape[-1]] = s
@@ -363,13 +435,7 @@ class MiniCPMV4_6MultiModalProcessor(MiniCPMVMultiModalProcessor):
                 frame_sizes.append(torch.tensor([w, h], dtype=torch.long, device="cpu"))
 
                 ip_out = image_processor([frame], **video_mm_kwargs)
-                pv = ip_out["pixel_values"]  # (1, C, P, sum_W)
-                ts = ip_out["target_sizes"]  # (n_slices, 2)
-                if pv.ndim == 4 and pv.shape[0] == 1:
-                    pv = pv.squeeze(0)  # (C, P, sum_W)
-                ts_long = ts.to(torch.long)
-                split_widths = (ts_long[:, 0] * ts_long[:, 1] * patch_size).tolist()
-                slices = torch.split(pv, split_widths, dim=-1)
+                slices, ts_long = _get_image_slices(ip_out, patch_size)
                 all_slices.extend(slices)
                 ts_list.append(ts_long)
 
@@ -494,9 +560,10 @@ class MiniCPMV4_6MultiModalProcessor(MiniCPMVMultiModalProcessor):
                 additional_placeholders.append((modality, sub_pattern))
         placeholders += additional_placeholders
 
-        # The 4.6 chat_template emits `<|image_pad|>` / `<|video_pad|>` rather
-        # than `<unk>`, so use those tokens as the embedding selector.
-        image_embed_text = getattr(tokenizer, "image_token", "<|image_pad|>")
+        image_embed_token_id = _get_image_embed_token_id(
+            tokenizer,
+            self.info.get_image_processor(),
+        )
         video_embed_text = getattr(tokenizer, "video_token", "<|video_pad|>")
         audio_embed_text = getattr(tokenizer, "audio_token", "<|audio_pad|>")
 
@@ -506,13 +573,13 @@ class MiniCPMV4_6MultiModalProcessor(MiniCPMVMultiModalProcessor):
                 (MiniCPMVImageEmbeddingItems, ImageProcessorItems),
             )
             image_size = images.get_image_size(item_idx)
-            return PromptUpdateDetails.select_text(
+            return PromptUpdateDetails.select_token_id(
                 self.get_image_prompt_texts(
                     image_size,
                     item_idx,
                     downsample_mode=ds_mode,
                 ),
-                image_embed_text,
+                image_embed_token_id,
             )
 
         def get_video_replacement(item_idx: int):
@@ -593,6 +660,24 @@ class MiniCPMV4_6MultiModalProcessor(MiniCPMVMultiModalProcessor):
         new_update = super()._recompute_cached_prompt_update(
             cached_update, new_item_idx
         )
+        if (
+            cached_update.modality == "image"
+            and hasattr(
+                self.info.get_image_processor(),
+                "get_slice_image_placeholder",
+            )
+        ):
+            tokenizer = self.info.get_tokenizer()
+            image_embed_token_id = _get_image_embed_token_id(
+                tokenizer,
+                self.info.get_image_processor(),
+            )
+            new_update = new_update.with_content(
+                PromptUpdateDetails.select_token_id(
+                    new_update.content.full,
+                    image_embed_token_id,
+                )
+            )
         # MiniCPM-V 4.6 prefixes video placeholders with `<image_id>{idx}</image_id>`
         # (the base class only rewrites the image modality).
         if cached_update.modality == "video":
@@ -738,6 +823,23 @@ class MiniCPMV4_6ProcessingInfo(MiniCPMVProcessingInfo):
             limits["audio"] = None
         return limits
 
+    def get_mm_max_tokens_per_item(
+        self,
+        seq_len: int,
+        mm_counts: Mapping[str, int],
+    ) -> Mapping[str, int]:
+        result: dict[str, int] = {}
+        if mm_counts.get("image", 0) > 0:
+            result["image"] = min(seq_len, self.get_max_image_tokens())
+        if mm_counts.get("video", 0) > 0:
+            result["video"] = min(
+                seq_len,
+                self.get_max_video_tokens(seq_len, mm_counts),
+            )
+        if mm_counts.get("audio", 0) > 0:
+            result["audio"] = min(seq_len, self.get_max_audio_tokens())
+        return result
+
     def get_num_frames_with_most_features(
         self,
         seq_len: int,
@@ -803,25 +905,18 @@ class MiniCPMV4_6ProcessingInfo(MiniCPMVProcessingInfo):
         downsample_mode = self._get_downsample_mode(downsample_mode)
         token_divisor = 4 if downsample_mode == "4x" else 16
 
-        # vLLM ImageSize is (width, height); transformers expects (height, width)
-        hf_image_size = (image_size.height, image_size.width)
+        image_size = (image_size.width, image_size.height)
 
-        # transformers v5.7+ requires `scale_resolution` arg
-        try:
-            grids = image_processor.get_sliced_grid(
-                hf_image_size,
-                max_slice_nums,
-                scale_res,
-            )
-        except TypeError:
-            grids = image_processor.get_sliced_grid(
-                hf_image_size,
-                max_slice_nums,
-            )
+        grids = _get_sliced_grid(
+            image_processor,
+            image_size,
+            max_slice_nums,
+            scale_res,
+        )
 
         if grids is None:
             best_size = image_processor.find_best_resize(
-                hf_image_size,
+                image_size,
                 scale_res,
                 patch_size,
                 allow_upscale=True,
@@ -832,7 +927,7 @@ class MiniCPMV4_6ProcessingInfo(MiniCPMVProcessingInfo):
             return [0, 0], source_tokens, 0
 
         best_resize = image_processor.find_best_resize(
-            hf_image_size,
+            image_size,
             scale_res,
             patch_size,
         )
@@ -840,7 +935,7 @@ class MiniCPMV4_6ProcessingInfo(MiniCPMVProcessingInfo):
             best_resize[0] * best_resize[1] // (patch_size * patch_size * token_divisor)
         )
         refine_size = image_processor.get_refine_size(
-            hf_image_size,
+            image_size,
             grids,
             scale_res,
             patch_size,
@@ -1212,6 +1307,12 @@ class MiniCPMV4_6ForConditionalGeneration(
 
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
+            "resampler.mlp.0.mlp.0.": "merger.mlp.0.linear_1.",
+            "resampler.mlp.0.mlp.2.": "merger.mlp.0.linear_2.",
+            "resampler.mlp.0.pre_norm.": "merger.mlp.0.pre_norm.",
+            "llm.": "language_model.",
+            "vit_merger.layer_norm2.": None,
+            "vit_merger.mlp.": None,
             # transformers v5.7+ uses `vision_tower` and nests `vit_merger`
             # inside it. Order matters: more specific prefix must come first.
             "model.vision_tower.vit_merger.": "vit_merger.",
@@ -1366,6 +1467,7 @@ class MiniCPMV4_6ForConditionalGeneration(
         self.multimodal_config = multimodal_config
         self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
         self.audio_input_enabled = _has_audio_input(config)
+        text_config = _normalize_text_config(config)
 
         self._init_canvas_mrope(vllm_config)
 
@@ -1387,7 +1489,7 @@ class MiniCPMV4_6ForConditionalGeneration(
             )
             self.merger = MiniCPMV4_6Merger(
                 hidden_size=config.vision_config.hidden_size,
-                llm_embed_dim=config.text_config.hidden_size,
+                llm_embed_dim=text_config.hidden_size,
             )
 
         if self.audio_input_enabled:
@@ -1406,13 +1508,13 @@ class MiniCPMV4_6ForConditionalGeneration(
                 )
                 self.audio_projection_layer = MultiModalProjector(
                     in_dim=audio_config.d_model,
-                    out_dim=config.text_config.hidden_size,
+                    out_dim=text_config.hidden_size,
                 )
                 self.audio_encoder_layer = -1
 
         # --- Language model ---
         with self._mark_language_model(vllm_config):
-            if config.text_config.model_type == "qwen3_5_moe_text":
+            if _get_text_model_type(config) == "qwen3_5_moe_text":
                 self.language_model = Qwen3_5MoeForCausalLM(
                     vllm_config=vllm_config,
                     prefix=maybe_prefix(prefix, "language_model"),
@@ -1650,11 +1752,12 @@ class MiniCPMV4_6ForConditionalGeneration(
             return inputs_embeds
 
         is_multimodal = _require_is_multimodal(is_multimodal)
-        return _merge_multimodal_embeddings(
+        inputs_embeds = _merge_multimodal_embeddings(
             inputs_embeds=inputs_embeds,
             multimodal_embeddings=multimodal_embeddings,
             is_multimodal=is_multimodal,
         )
+        return inputs_embeds
 
     # ----- Forward / Logits -----
 
