@@ -495,6 +495,10 @@ _MULTIMODAL_MODELS = {
         "MiniMaxM3SparseForConditionalGeneration",
     ),
     "MiniCPMO": ("minicpmo", "MiniCPMO"),
+    "MiniCPMO4_6ForConditionalGeneration": (
+        "minicpmv4_6",
+        "MiniCPMV4_6ForConditionalGeneration",
+    ),
     "MiniCPMV": ("minicpmv", "MiniCPMV"),
     "MiniCPMV4_6ForConditionalGeneration": (
         "minicpmv4_6",
