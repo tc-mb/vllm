@@ -564,6 +564,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 extra_kwargs,
             ),
             media_io_kwargs=self.media_io_kwargs,
+            mm_processor_kwargs=self.mm_processor_kwargs,
             return_assistant_tokens_mask=bool(self.return_assistant_tokens_mask),
             # No-tools requests default to tool_choice="none" at the API
             # layer. Collapse that default before rendering, so K3 emits a

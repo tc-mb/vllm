@@ -143,7 +143,15 @@ async def init_generate_state(
     )
     state.ocr_pipeline = None
     cli_layout_model = getattr(args, "ocr_layout_model", None)
-    layout_model = cli_layout_model or os.getenv("OCR_LAYOUT_MODEL")
+    disable_ocr = os.getenv("OCR_DISABLE_PIPELINE", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if disable_ocr:
+        layout_model = None
+    else:
+        layout_model = cli_layout_model or os.getenv("OCR_LAYOUT_MODEL")
     if layout_model and state.openai_serving_chat_batch is not None:
         from vllm.entrypoints.openai.chat_completion.ocr_pipeline import (
             OCRPipelineServing,

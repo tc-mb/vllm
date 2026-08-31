@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only MiniCPM-V 4.6 model (MiniCPMV4_6ForConditionalGeneration)."""
 
+import os
 from collections.abc import Iterable, Mapping
 from typing import Any
 
@@ -45,6 +46,7 @@ from .interfaces import (
     HasInnerState,
     IsHybrid,
     MultiModalEmbeddings,
+    SupportsEagle3,
     SupportsLoRA,
     SupportsMRoPE,
     SupportsMultiModal,
@@ -97,16 +99,25 @@ class MiniCPMV4_6MultiModalProcessor(MiniCPMVMultiModalProcessor):
             return str(ds)
         return self.info._get_downsample_mode()
 
+    def _resolve_max_slice_nums(
+        self,
+        mm_kwargs: Mapping[str, object],
+    ) -> int | None:
+        max_slice_nums = mm_kwargs.get("max_slice_nums")
+        return None if max_slice_nums is None else int(max_slice_nums)
+
     def get_image_prompt_texts(
         self,
         image_size,
         image_idx: int = 0,
         downsample_mode: str | None = None,
+        max_slice_nums: int | None = None,
     ) -> str:
         return self.info.get_slice_image_placeholder(
             image_size,
             image_idx=image_idx,
             downsample_mode=downsample_mode,
+            max_slice_nums=max_slice_nums,
         )
 
     def get_video_prompt_texts(
@@ -319,6 +330,7 @@ class MiniCPMV4_6MultiModalProcessor(MiniCPMVMultiModalProcessor):
         out_mm_kwargs,
     ):
         ds_mode = self._resolve_downsample_mode(hf_processor_mm_kwargs)
+        max_slice_nums = self._resolve_max_slice_nums(hf_processor_mm_kwargs)
 
         placeholders = [
             ("image", self.info.image_pattern),
@@ -350,6 +362,7 @@ class MiniCPMV4_6MultiModalProcessor(MiniCPMVMultiModalProcessor):
                     image_size,
                     item_idx,
                     downsample_mode=ds_mode,
+                    max_slice_nums=max_slice_nums,
                 ),
                 image_embed_text,
             )
@@ -472,6 +485,9 @@ class MiniCPMV4_6ProcessingInfo(MiniCPMVProcessingInfo):
                 val = getattr(image_processor, attr, None)
                 if isinstance(val, np.ndarray):
                     setattr(image_processor, attr, val.tolist())
+            env_max_slice = os.getenv("OCR_MAX_SLICE_NUMS")
+            if env_max_slice:
+                image_processor.max_slice_nums = int(env_max_slice)
 
         return hf_processor
 
@@ -488,6 +504,13 @@ class MiniCPMV4_6ProcessingInfo(MiniCPMVProcessingInfo):
         return {"image": None, "video": None}
 
     def get_image_max_slice_num(self) -> int:
+        env_max_slice = os.getenv("OCR_MAX_SLICE_NUMS")
+        if env_max_slice:
+            return int(env_max_slice)
+        image_processor = self.get_image_processor()
+        processor_max = getattr(image_processor, "max_slice_nums", None)
+        if processor_max is not None:
+            return int(processor_max)
         config = self.get_hf_config()
         if hasattr(config, "slice_config") and config.slice_config is not None:
             return getattr(config.slice_config, "max_slice_nums", 9)
@@ -934,6 +957,7 @@ class MiniCPMV4_6ForConditionalGeneration(
     HasInnerState,
     IsHybrid,
     SupportsMRoPE,
+    SupportsEagle3,
 ):
     supports_encoder_tp_data = True
 
@@ -1265,14 +1289,58 @@ class MiniCPMV4_6ForConditionalGeneration(
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
 
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.language_model.set_aux_hidden_state_layers(layers)
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        return self.language_model.get_eagle3_aux_hidden_state_layers()
+
     # ----- Weight loading -----
 
     def load_weights(
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
     ) -> set[str]:
+        # HF ViT stores q/k/v; vLLM uses fused qkv_proj. Merge before the
+        # nested loader. Do not use orig_to_new_stacked here: v_proj also
+        # matches inside qkv_proj and becomes qkqkv_proj.
+        vision_qkv: dict[str, dict[str, torch.Tensor]] = {}
+
+        def normalized_weights():
+            for name, tensor in weights:
+                marker = ".self_attn."
+                if (
+                    name.startswith("model.vision_tower.")
+                    and marker in name
+                    and (".q_proj." in name or ".k_proj." in name or ".v_proj." in name)
+                ):
+                    prefix, suffix = name.split(marker, 1)
+                    projection, parameter = suffix.split(".", 1)
+                    vision_qkv.setdefault(prefix, {})[f"{projection}.{parameter}"] = (
+                        tensor
+                    )
+                    continue
+                yield name, tensor
+
+            for prefix, group in vision_qkv.items():
+                for parameter in ("weight", "bias"):
+                    keys = tuple(
+                        f"{projection}.{parameter}"
+                        for projection in ("q_proj", "k_proj", "v_proj")
+                    )
+                    if not all(key in group for key in keys):
+                        missing = [key for key in keys if key not in group]
+                        raise ValueError(
+                            f"Incomplete MiniCPMV vision QKV group at {prefix}: "
+                            f"missing={missing}"
+                        )
+                    yield (
+                        f"{prefix}.self_attn.qkv_proj.{parameter}",
+                        torch.cat([group[key] for key in keys], dim=0),
+                    )
+
         loader = AutoWeightsLoader(self, skip_prefixes=["mtp."])
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        return loader.load_weights(normalized_weights(), mapper=self.hf_to_vllm_mapper)
 
     def get_mm_mapping(self) -> MultiModelKeys:
         return MultiModelKeys.from_string_field(
