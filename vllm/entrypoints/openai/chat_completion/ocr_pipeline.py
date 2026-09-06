@@ -9,14 +9,11 @@ import re
 from collections import Counter
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
-import torch
+import numpy as np
 from PIL import Image
-
-from vllm.entrypoints.openai.chat_completion.layout_postprocess import (
-    apply_layout_postprocess,
-)
 
 from vllm.entrypoints.openai.chat_completion.batch_serving import (
     OpenAIServingChatBatch,
@@ -75,6 +72,37 @@ _IGNORE_LABELS = {
 }
 _LABEL_MAP = {"formula": "display_formula"}
 
+# PaddleOCR-VL-1.6 PP-DocLayoutV3 recipe (OmniDocBench v1.6 layout cache).
+_LAYOUT_MODEL_NAME = "PP-DocLayoutV3"
+_LAYOUT_THRESHOLD = 0.3
+_LAYOUT_SHAPE_MODE = "auto"
+_LAYOUT_PARAMS_FILENAME = "inference.pdiparams"
+_MERGE_BBOXES_MODE = {
+    3: "large",  # chart
+    5: "large",  # display_formula
+    6: "large",  # doc_title
+    15: "large",  # inline_formula
+    17: "large",  # paragraph_title
+}
+_NON_MERGE_LABELS = [
+    "image",
+    "header_image",
+    "footer_image",
+    "chart",
+    "seal",
+    "table",
+]
+
+
+def _to_paddle_device(device: str) -> str:
+    device = (device or "").strip().lower()
+    if not device or device.startswith("cpu"):
+        return "cpu"
+    if device.startswith(("cuda", "gpu")):
+        _, _, index = device.partition(":")
+        return f"gpu:{index if index.isdigit() else '0'}"
+    return device
+
 
 @dataclass
 class OCRBlock:
@@ -92,71 +120,125 @@ class OCRDocument:
 
 
 class PPDocLayoutService:
+    """PP-DocLayoutV3 through PaddleX plus PaddleOCR-VL box filtering,
+    polygon-masked cropping, and cross-column text merging.
+    """
+
     def __init__(self, model_path: str, device: str = "cpu", max_crops: int = 64):
         self.model_path = model_path
-        self.device = (
-            device if device.startswith("cuda") and torch.cuda.is_available() else "cpu"
-        )
+        self.device = _to_paddle_device(device)
         self.max_crops = max_crops
-        self._processor: Any | None = None
         self._model: Any | None = None
+        self._crop_by_boxes: Any | None = None
+        self._filter_overlap_boxes: Any | None = None
+        self._merge_blocks: Any | None = None
         self._lock = asyncio.Lock()
 
     def _load(self) -> None:
         if self._model is not None:
             return
-        from transformers import AutoImageProcessor, AutoModelForObjectDetection
+        try:
+            import importlib
+
+            from paddlex import create_model
+
+            crop_mod = importlib.import_module(
+                "paddlex.inference.pipelines.components.common.crop_image_regions"
+            )
+            vl_utils = importlib.import_module(
+                "paddlex.inference.pipelines.paddleocr_vl.uilts"
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "OCR layout requires paddlepaddle and paddlex "
+                "(Paddle inference PP-DocLayoutV3). Original error: %s" % exc
+            ) from exc
+
+        params = Path(self.model_path) / _LAYOUT_PARAMS_FILENAME
+        if not params.is_file():
+            raise FileNotFoundError(
+                "ocr_layout_model must be a Paddle inference dir "
+                f"(missing {_LAYOUT_PARAMS_FILENAME}): {self.model_path}"
+            )
 
         logger.info(
             "Loading PP-DocLayoutV3 from %s on %s", self.model_path, self.device
         )
-        self._processor = AutoImageProcessor.from_pretrained(self.model_path)
-        self._model = AutoModelForObjectDetection.from_pretrained(self.model_path)
-        self._model.to(self.device)
-        self._model.eval()
+        self._model = create_model(
+            model_name=_LAYOUT_MODEL_NAME,
+            model_dir=self.model_path,
+            device=self.device,
+            threshold=_LAYOUT_THRESHOLD,
+            layout_nms=True,
+            layout_merge_bboxes_mode=dict(_MERGE_BBOXES_MODE),
+        )
+        self._crop_by_boxes = crop_mod.CropByBoxes()
+        self._filter_overlap_boxes = vl_utils.filter_overlap_boxes
+        self._merge_blocks = vl_utils.merge_blocks
+
+    def _boxes_from_predict(self, raw_boxes: list[dict[str, Any]]) -> list[dict]:
+        boxes: list[dict] = []
+        for box in raw_boxes:
+            item = {
+                "cls_id": int(box["cls_id"]),
+                "label": box["label"],
+                "score": float(box["score"]),
+                "coordinate": [float(v) for v in box["coordinate"]],
+            }
+            polygon = box.get("polygon_points")
+            if polygon is not None and len(np.asarray(polygon)):
+                item["polygon_points"] = np.asarray(polygon, dtype=np.float64).reshape(
+                    -1, 2
+                )
+            boxes.append(item)
+        return boxes
 
     def _parse(self, image: Image.Image) -> list[OCRBlock]:
         self._load()
-        assert self._processor is not None
         assert self._model is not None
+        assert self._crop_by_boxes is not None
+        assert self._filter_overlap_boxes is not None
+        assert self._merge_blocks is not None
 
-        inputs = self._processor(images=image, return_tensors="pt")
-        if self.device != "cpu":
-            inputs = {key: value.to(self.device) for key, value in inputs.items()}
-        with torch.inference_mode():
-            outputs = self._model(**inputs)
-        result = self._processor.post_process_object_detection(
-            outputs, target_sizes=[image.size[::-1]]
-        )[0]
-        # NMS + nested-box dedup + oversized-image filter; without it,
-        # sub-boxes nested inside paragraph boxes get OCR'd twice.
-        detections = apply_layout_postprocess(
-            raw_results=[result],
-            id2label={int(k): v for k, v in self._model.config.id2label.items()},
-            img_sizes=[image.size],
-            layout_nms=True,
-            layout_unclip_ratio=None,
-            layout_merge_bboxes_mode="large",
-        )[0]
+        # Feed RGB as-is; the OmniDocBench v1.6 cache used this colorspace.
+        rgb = np.asarray(image.convert("RGB"))
+        results = list(
+            self._model.predict(
+                rgb,
+                batch_size=1,
+                layout_shape_mode=_LAYOUT_SHAPE_MODE,
+                filter_overlap_boxes=False,
+            )
+        )
+        raw_boxes = list(results[0].get("boxes", [])) if results else []
+        boxes = self._boxes_from_predict(raw_boxes)
+        if boxes:
+            boxes = self._filter_overlap_boxes({"boxes": boxes}, _LAYOUT_SHAPE_MODE)[
+                "boxes"
+            ]
+        cropped = self._crop_by_boxes(rgb, boxes, _LAYOUT_SHAPE_MODE) if boxes else []
+        merged = self._merge_blocks(
+            cropped,
+            non_merge_labels=_NON_MERGE_LABELS,
+            layout_shape_mode=_LAYOUT_SHAPE_MODE,
+        )
 
         blocks: list[OCRBlock] = []
-        for idx, detection in enumerate(detections):
+        for idx, block in enumerate(merged):
+            crop = block.get("img")
+            if crop is None:
+                continue
             if self.max_crops > 0 and len(blocks) >= self.max_crops:
                 logger.warning("Truncated OCR layout to %d blocks", self.max_crops)
                 break
-            raw_label = detection["label"]
-            label = _LABEL_MAP.get(raw_label, raw_label)
-            box = [float(value) for value in detection["coordinate"]]
-            x1 = max(0, min(image.width - 1, int(round(box[0]))))
-            y1 = max(0, min(image.height - 1, int(round(box[1]))))
-            x2 = max(x1 + 1, min(image.width, int(round(box[2]))))
-            y2 = max(y1 + 1, min(image.height, int(round(box[3]))))
+            raw_label = str(block["label"])
+            x1, y1, x2, y2 = (int(round(float(v))) for v in block["box"])
             blocks.append(
                 OCRBlock(
-                    label=label,
+                    label=_LABEL_MAP.get(raw_label, raw_label),
                     order=idx,
                     bbox=(x1, y1, x2, y2),
-                    image=image.crop((x1, y1, x2, y2)),
+                    image=Image.fromarray(crop),
                 )
             )
         return blocks

@@ -149,9 +149,10 @@ class BaseFrontendArgs:
     --enable-log-outputs is set.
     """
     ocr_layout_model: str | None = None
-    """Enable the OCR document pipeline with this PP-DocLayoutV3 model path."""
+    """Enable the OCR document pipeline with a PP-DocLayoutV3 Paddle
+    inference directory (inference.pdiparams + inference.yml)."""
     ocr_layout_device: str = "cpu"
-    """Device used by PP-DocLayoutV3."""
+    """Device used by PP-DocLayoutV3 (`cpu`, `cuda`, or `cuda:N`)."""
     ocr_max_crops: int = 0
     """Maximum layout regions per page; 0 keeps all detected regions."""
     ocr_max_tokens: int = 8192

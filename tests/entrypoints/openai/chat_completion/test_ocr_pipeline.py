@@ -5,14 +5,17 @@ import asyncio
 import base64
 from unittest.mock import AsyncMock, Mock, patch
 
+import numpy as np
 from PIL import Image
 
 from vllm.entrypoints.openai.chat_completion.ocr_pipeline import (
     OCRBlock,
     OCRPipelineServing,
+    PPDocLayoutService,
     _assemble_markdown,
     _extract_document,
     _postprocess_content,
+    _to_paddle_device,
 )
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
@@ -342,3 +345,84 @@ async def _test_pipeline_keeps_successful_pages_after_page_failure():
         "<!-- Page 2 -->\n\nSecond page"
     )
     assert response.usage.total_tokens == 7
+
+
+def test_to_paddle_device():
+    assert _to_paddle_device("cpu") == "cpu"
+    assert _to_paddle_device("CUDA") == "gpu:0"
+    assert _to_paddle_device("cuda:1") == "gpu:1"
+    assert _to_paddle_device("gpu:0") == "gpu:0"
+
+
+def test_layout_parse_uses_paddlex_filter_crop_merge():
+    service = PPDocLayoutService("/layout", "cpu", max_crops=0)
+    crop = np.zeros((8, 6, 3), dtype=np.uint8)
+    service._model = Mock()
+    service._model.predict.return_value = [
+        {
+            "boxes": [
+                {
+                    "cls_id": 6,
+                    "label": "doc_title",
+                    "score": 0.9,
+                    "coordinate": [1.2, 2.4, 7.6, 9.1],
+                    "polygon_points": [[1, 2], [8, 2], [8, 9], [1, 9]],
+                }
+            ]
+        }
+    ]
+    service._filter_overlap_boxes = Mock(side_effect=lambda data, _mode: data)
+    service._crop_by_boxes = Mock(
+        return_value=[{"label": "doc_title", "box": [1, 2, 8, 9], "img": crop}]
+    )
+    service._merge_blocks = Mock(side_effect=lambda cropped, **_kwargs: cropped)
+
+    image = Image.new("RGB", (16, 12), "white")
+    blocks = service._parse(image)
+
+    assert [block.label for block in blocks] == ["doc_title"]
+    assert blocks[0].bbox == (1, 2, 8, 9)
+    assert blocks[0].image.size == (6, 8)
+    predict_kwargs = service._model.predict.call_args.kwargs
+    assert predict_kwargs["filter_overlap_boxes"] is False
+    assert predict_kwargs["layout_shape_mode"] == "auto"
+    np.testing.assert_array_equal(
+        service._model.predict.call_args.args[0], np.asarray(image)
+    )
+    service._filter_overlap_boxes.assert_called_once()
+    service._crop_by_boxes.assert_called_once()
+    service._merge_blocks.assert_called_once()
+    assert service._merge_blocks.call_args.kwargs["non_merge_labels"] == [
+        "image",
+        "header_image",
+        "footer_image",
+        "chart",
+        "seal",
+        "table",
+    ]
+
+
+def test_layout_parse_drops_folded_crops_and_maps_formula():
+    service = PPDocLayoutService("/layout", "cpu", max_crops=0)
+    service._model = Mock()
+    service._model.predict.return_value = [{"boxes": []}]
+    service._filter_overlap_boxes = Mock()
+    service._crop_by_boxes = Mock()
+    service._merge_blocks = Mock(
+        return_value=[
+            {
+                "label": "formula",
+                "box": [0, 0, 4, 4],
+                "img": np.zeros((4, 4, 3), dtype=np.uint8),
+            },
+            {"label": "text", "box": [0, 4, 4, 8], "img": None},
+        ]
+    )
+
+    blocks = service._parse(Image.new("RGB", (8, 8), "white"))
+
+    assert len(blocks) == 1
+    assert blocks[0].label == "display_formula"
+    assert blocks[0].order == 0
+    service._filter_overlap_boxes.assert_not_called()
+    service._crop_by_boxes.assert_not_called()
