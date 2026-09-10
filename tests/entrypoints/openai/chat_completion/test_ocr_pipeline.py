@@ -73,7 +73,9 @@ def make_pdf_request(pdf_data: bytes = b"%PDF-test") -> ChatCompletionRequest:
     )
 
 
-def make_pipeline(batch_serving: Mock) -> OCRPipelineServing:
+def make_pipeline(
+    batch_serving: Mock, crop_concurrency: int = 16
+) -> OCRPipelineServing:
     return OCRPipelineServing(
         batch_serving=batch_serving,
         layout_model="/layout",
@@ -82,6 +84,7 @@ def make_pipeline(batch_serving: Mock) -> OCRPipelineServing:
         max_tokens=8192,
         max_slice_nums=9,
         max_pdf_pages=8,
+        crop_concurrency=crop_concurrency,
     )
 
 
@@ -167,6 +170,86 @@ async def _test_pipeline_batches_crops_and_returns_markdown():
         "downsample_mode": "4x",
         "max_slice_nums": 9,
     }
+
+
+def test_pipeline_runs_crops_concurrently():
+    asyncio.run(_test_pipeline_runs_crops_concurrently())
+
+
+async def _test_pipeline_runs_crops_concurrently():
+    inflight = 0
+    max_inflight = 0
+
+    async def create_chat_completion(request, _):
+        nonlocal inflight, max_inflight
+        inflight += 1
+        max_inflight = max(max_inflight, inflight)
+        await asyncio.sleep(0.05)
+        inflight -= 1
+        return ChatCompletionResponse(
+            model="ocr-model",
+            choices=[
+                ChatCompletionResponseChoice(
+                    index=0,
+                    message=ChatMessage(role="assistant", content="ok"),
+                )
+            ],
+            usage=UsageInfo(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+        )
+
+    batch_serving = Mock()
+    batch_serving.create_chat_completion = create_chat_completion
+    pipeline = make_pipeline(batch_serving, crop_concurrency=16)
+    pipeline.layout.parse = AsyncMock(
+        return_value=[
+            OCRBlock("text", i, (0, 0, 8, 4), Image.new("RGB", (8, 4), "white"))
+            for i in range(8)
+        ]
+    )
+
+    response = await pipeline.create_chat_completion(make_request(), Mock())
+
+    assert isinstance(response, ChatCompletionResponse)
+    assert max_inflight == 8
+
+
+def test_pipeline_crop_semaphore_caps_inflight():
+    asyncio.run(_test_pipeline_crop_semaphore_caps_inflight())
+
+
+async def _test_pipeline_crop_semaphore_caps_inflight():
+    inflight = 0
+    max_inflight = 0
+
+    async def create_chat_completion(request, _):
+        nonlocal inflight, max_inflight
+        inflight += 1
+        max_inflight = max(max_inflight, inflight)
+        await asyncio.sleep(0.02)
+        inflight -= 1
+        return ChatCompletionResponse(
+            model="ocr-model",
+            choices=[
+                ChatCompletionResponseChoice(
+                    index=0,
+                    message=ChatMessage(role="assistant", content="ok"),
+                )
+            ],
+            usage=UsageInfo(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+        )
+
+    batch_serving = Mock()
+    batch_serving.create_chat_completion = create_chat_completion
+    pipeline = make_pipeline(batch_serving, crop_concurrency=2)
+    pipeline.layout.parse = AsyncMock(
+        return_value=[
+            OCRBlock("text", i, (0, 0, 8, 4), Image.new("RGB", (8, 4), "white"))
+            for i in range(6)
+        ]
+    )
+
+    await pipeline.create_chat_completion(make_request(), Mock())
+    assert max_inflight == 2
 
 
 def test_pipeline_streams_openai_chunks():

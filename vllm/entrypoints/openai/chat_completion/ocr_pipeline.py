@@ -453,14 +453,24 @@ class OCRPipelineServing:
         max_tokens: int,
         max_slice_nums: int,
         max_pdf_pages: int,
+        crop_concurrency: int = 16,
     ):
         if max_pdf_pages < 0:
             raise ValueError("ocr_max_pdf_pages must not be negative")
+        if crop_concurrency < 1:
+            raise ValueError("ocr_crop_concurrency must be >= 1")
         self.batch_serving = batch_serving
         self.layout = PPDocLayoutService(layout_model, layout_device, max_crops)
         self.max_tokens = max_tokens
         self.max_slice_nums = max_slice_nums
         self.max_pdf_pages = max_pdf_pages
+        self.crop_concurrency = crop_concurrency
+        self._crop_sema = asyncio.Semaphore(crop_concurrency)
+        logger.info(
+            "OCR pipeline crop_concurrency=%d layout_device=%s",
+            crop_concurrency,
+            layout_device,
+        )
 
     def can_handle(self, request: ChatCompletionRequest) -> bool:
         return _has_document(request)
@@ -494,17 +504,38 @@ class OCRPipelineServing:
 
         page_markdown: list[str] = []
         usage = UsageInfo()
+        pending_layout: asyncio.Task[list[OCRBlock]] | None = None
+        pending_image: Image.Image | None = None
         for page_index in range(page_count):
-            image = document.image
+            image: Image.Image | None = None
+            blocks: list[OCRBlock] = []
             try:
-                if document.pdf_data is not None:
-                    image = await asyncio.to_thread(
+                if pending_layout is not None:
+                    image = pending_image
+                    pending_image = None
+                    blocks = await pending_layout
+                    pending_layout = None
+                else:
+                    if document.pdf_data is not None:
+                        image = await asyncio.to_thread(
+                            _render_pdf_page,
+                            document.pdf_data,
+                            page_index,
+                        )
+                    else:
+                        image = document.image
+                    assert image is not None
+                    blocks = await self.layout.parse(image)
+                if document.pdf_data is not None and page_index + 1 < page_count:
+                    pending_image = await asyncio.to_thread(
                         _render_pdf_page,
                         document.pdf_data,
-                        page_index,
+                        page_index + 1,
                     )
-                assert image is not None
-                page_result = await self._process_page(request, image)
+                    pending_layout = asyncio.create_task(
+                        self.layout.parse(pending_image)
+                    )
+                page_result = await self._process_blocks(request, blocks)
                 if isinstance(page_result, ErrorResponse):
                     message = page_result.error.message
                     logger.warning(
@@ -530,8 +561,14 @@ class OCRPipelineServing:
                 logger.exception("OCR processing failed for page %d", page_index + 1)
                 page_markdown.append(_page_failure_marker(page_index + 1, str(exc)))
             finally:
+                for block in blocks:
+                    block.image.close()
                 if image is not None:
                     image.close()
+        if pending_layout is not None:
+            pending_layout.cancel()
+        if pending_image is not None:
+            pending_image.close()
 
         if page_count == 1:
             markdown = page_markdown[0]
@@ -564,8 +601,12 @@ class OCRPipelineServing:
         if not infer_blocks:
             return _assemble_markdown(blocks), UsageInfo()
 
-        usage = UsageInfo()
-        for block in infer_blocks:
+        ordered = sorted(
+            infer_blocks,
+            key=lambda block: -(block.image.size[0] * block.image.size[1]),
+        )
+
+        async def _one(block: OCRBlock):
             prompt, max_tokens, output_format = _ELEMENT_CONFIG.get(
                 block.label, ("Text Recognition:", 8192, "text")
             )
@@ -596,7 +637,13 @@ class OCRPipelineServing:
                 priority=request.priority,
                 stream=False,
             )
-            crop_response = await self._infer_crop(crop_request)
+            async with self._crop_sema:
+                crop_response = await self._infer_crop(crop_request)
+            return block, output_format, crop_response
+
+        results = await asyncio.gather(*[_one(block) for block in ordered])
+        usage = UsageInfo()
+        for block, output_format, crop_response in results:
             if isinstance(crop_response, ErrorResponse):
                 return crop_response
             if not isinstance(crop_response, ChatCompletionResponse):
@@ -605,7 +652,6 @@ class OCRPipelineServing:
                     err_type="InternalServerError",
                     status_code=500,
                 )
-
             content = crop_response.choices[0].message.content
             raw_content = content if isinstance(content, str) else ""
             block.content = _postprocess_content(

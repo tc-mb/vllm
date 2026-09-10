@@ -163,12 +163,14 @@ async def init_generate_state(
             max_tokens = args.ocr_max_tokens
             max_slice_nums = args.ocr_max_slice_nums
             max_pdf_pages = args.ocr_max_pdf_pages
+            crop_concurrency = args.ocr_crop_concurrency
         else:
             layout_device = os.getenv("OCR_LAYOUT_DEVICE", "cpu")
             max_crops = int(os.getenv("OCR_MAX_CROPS", "0"))
             max_tokens = int(os.getenv("OCR_MAX_TOKENS", "8192"))
             max_slice_nums = int(os.getenv("OCR_MAX_SLICE_NUMS", "9"))
             max_pdf_pages = int(os.getenv("OCR_MAX_PDF_PAGES", "0"))
+            crop_concurrency = int(os.getenv("OCR_CROP_CONCURRENCY", "16"))
         state.ocr_pipeline = OCRPipelineServing(
             batch_serving=state.openai_serving_chat_batch,
             layout_model=layout_model,
@@ -177,6 +179,7 @@ async def init_generate_state(
             max_tokens=max_tokens,
             max_slice_nums=max_slice_nums,
             max_pdf_pages=max_pdf_pages,
+            crop_concurrency=crop_concurrency,
         )
     if state.openai_serving_chat is not None:
         state.openai_serving_chat.warmup()

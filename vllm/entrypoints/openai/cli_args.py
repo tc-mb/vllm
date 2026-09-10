@@ -161,6 +161,8 @@ class BaseFrontendArgs:
     """Maximum image slices used by the OCR model for each layout region."""
     ocr_max_pdf_pages: int = 0
     """Maximum PDF pages per OCR request; 0 keeps all pages."""
+    ocr_crop_concurrency: int = 16
+    """Max in-flight OCR crop requests per replica (layout stays serial)."""
     log_error_stack: bool = envs.VLLM_SERVER_DEV_MODE
     """If set to True, log the stack trace of error responses"""
     tokens_only: bool = False
