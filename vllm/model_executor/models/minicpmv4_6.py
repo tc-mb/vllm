@@ -46,6 +46,7 @@ from .interfaces import (
     HasInnerState,
     IsHybrid,
     MultiModalEmbeddings,
+    SupportsEagle3,
     SupportsLoRA,
     SupportsMRoPE,
     SupportsMultiModal,
@@ -985,6 +986,7 @@ class MiniCPMV4_6ForConditionalGeneration(
     SupportsPP,
     HasInnerState,
     IsHybrid,
+    SupportsEagle3,
     SupportsMRoPE,
 ):
     supports_encoder_tp_data = True
