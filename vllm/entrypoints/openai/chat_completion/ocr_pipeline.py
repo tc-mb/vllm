@@ -36,6 +36,7 @@ _PDF_DATA_URL_RE = re.compile(
 )
 _DISPLAY_BRACKET_SEP_RE = re.compile(re.escape(r"\]") + r"\s*" + re.escape(r"\["))
 _INLINE_LATEX_RE = re.compile(r"\\\((.+?)\\\)")
+_WORD_RE = re.compile(r"\S+")
 _PDF_SCALE = 2.0
 
 _ELEMENT_CONFIG = {
@@ -368,10 +369,66 @@ def _render_pdf_page(pdf_data: bytes, page_index: int) -> Image.Image:
         document.close()
 
 
+def _truncate_repetitive_suffix(text: str) -> str:
+    """Cut runaway generation loops: three consecutive identical word windows.
+
+    Concurrent batching occasionally flips a long table/text crop into a
+    repeat loop that runs to max_tokens; this trims the looped suffix so the
+    assembled markdown stays clean even when decoding already paid the cost.
+    """
+    words = list(_WORD_RE.finditer(text))
+    if len(words) < 18:
+        return text
+
+    normalized = [match.group(0).lower() for match in words]
+    earliest_cut = len(text)
+    max_window = min(64, len(words) // 3)
+    for window in range(6, max_window + 1):
+        limit = len(words) - (window * 3) + 1
+        for start in range(limit):
+            first = normalized[start : start + window]
+            if (
+                first == normalized[start + window : start + (window * 2)]
+                and first == normalized[start + (window * 2) : start + (window * 3)]
+            ):
+                earliest_cut = min(earliest_cut, words[start].start())
+                break
+
+    if earliest_cut < len(text):
+        return text[:earliest_cut].rstrip()
+    return text
+
+
 def _truncate_repetitive_content(content: str, min_count: int) -> str:
-    if len(content) < min_count:
+    if not content or len(content) < min_count:
         return content
-    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    stripped = content.strip()
+    if not stripped:
+        return content
+
+    # A fixed-length unit looping at the tail over more than half the string.
+    if "\n" not in stripped and len(stripped) > 100:
+        for unit_len in range(8, len(stripped) // 5 + 1):
+            unit = stripped[-unit_len:]
+            count = 0
+            pos = len(stripped) - unit_len
+            while pos >= 0 and stripped[pos : pos + unit_len] == unit:
+                count += 1
+                pos -= unit_len
+            if count >= 5 and len(unit) * count > len(stripped) * 0.5:
+                return stripped[: len(stripped) - (count * unit_len)]
+
+    # The whole string is one short unit repeated over and over.
+    if "\n" not in stripped and len(stripped) > 10:
+        for unit_len in range(1, len(stripped) // 2 + 1):
+            repeats = len(stripped) // unit_len
+            unit = stripped[:unit_len]
+            if unit * repeats == stripped[: unit_len * repeats]:
+                if repeats >= 10:
+                    return unit
+                break
+
+    lines = [line.strip() for line in stripped.split("\n") if line.strip()]
     if len(lines) >= 10:
         most_common, count = Counter(lines).most_common(1)[0]
         if count >= 10 and count / len(lines) >= 0.8:
@@ -402,6 +459,7 @@ def _postprocess_content(content: str, output_format: str, label: str) -> str:
             content += "</table>" * max(
                 0, content.count("<table") - content.count("</table>")
             )
+    content = _truncate_repetitive_suffix(content.strip())
     if label != "display_formula":
         content = _INLINE_LATEX_RE.sub(
             lambda match: f"${match.group(1).strip()}$", content
