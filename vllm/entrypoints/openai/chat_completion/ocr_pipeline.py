@@ -38,7 +38,43 @@ _PDF_DATA_URL_RE = re.compile(
 _DISPLAY_BRACKET_SEP_RE = re.compile(re.escape(r"\]") + r"\s*" + re.escape(r"\["))
 _INLINE_LATEX_RE = re.compile(r"\\\((.+?)\\\)")
 _WORD_RE = re.compile(r"\S+")
+_EMPTY_BRACKET_MATH_RE = re.compile(r"\\\[\s*\\\]|\\\(\s*\\\)")
+_DISPLAY_SPAN_RE = re.compile(r"\\\[(.*?)\\\]|\$\$(.*?)\$\$", re.DOTALL)
+_DISPLAY_DOLLAR_SPLIT_RE = re.compile(r"(\$\$)")
+_DISPLAY_DOLLAR_RE = re.compile(r"(?<!\\)\$\$")
+_INLINE_DOLLAR_RE = re.compile(r"(?<!\\)(?<!\$)\$(?!\$)")
+_TRAILING_BACKSLASH_RE = re.compile(r"(?<!\\)\\$")
+_BEGIN_RE = re.compile(r"\\begin\{")
+_END_RE = re.compile(r"\\end\{")
+_INLINE_MATH_RE = re.compile(
+    r"(?<!\\)\$(?!\$)(?:[^$\n]|\\.)+?(?<!\\)\$(?!\$)|\\\([^\n]*?\\\)"
+)
+_LATEX_SPACING_RE = re.compile(
+    r"\\(?:quad|qquad|enspace|thinspace|medspace|thickspace|"
+    r"negthinspace|negmedspace|negthickspace)(?![A-Za-z])"
+)
+_LATEX_SHORT_SPACE_RE = re.compile(r"\\[,;:!]")
+_LATEX_BACKSLASH_SPACE_RE = re.compile(r"\\ ")
+_LATEX_HVSPACE_RE = re.compile(r"\\(?:hspace|vspace)\s*\{[^{}]*\}")
+_LATEX_STRIPPED_CHARS_RE = re.compile(r"[\s{}]")
 _PDF_SCALE = 2.0
+
+# Labels whose crops hold ordinary prose: line layout inside them is an
+# artefact of the crop, so the text is re-flowed into paragraphs.
+_TEXT_BLOCK_LABELS = {
+    "text",
+    "content",
+    "abstract",
+    "reference",
+    "reference_content",
+    "vertical_text",
+    "vision_footnote",
+    "algorithm",
+    "header",
+    "footer",
+    "footnote",
+    "aside_text",
+}
 
 _ELEMENT_CONFIG = {
     "text": ("Text Recognition:", 4096, "text"),
@@ -113,6 +149,7 @@ class OCRBlock:
     bbox: tuple[int, int, int, int]
     image: Image.Image
     content: str = ""
+    inline_formula_mixed: bool = False
 
 
 @dataclass
@@ -437,11 +474,183 @@ def _truncate_repetitive_content(content: str, min_count: int) -> str:
     return content
 
 
-def _postprocess_content(content: str, output_format: str, label: str) -> str:
+def _strip_spacing_tokens(content: str) -> str:
+    content = _LATEX_SPACING_RE.sub("", content)
+    content = _LATEX_SHORT_SPACE_RE.sub("", content)
+    content = _LATEX_BACKSLASH_SPACE_RE.sub("", content)
+    content = _LATEX_HVSPACE_RE.sub("", content)
+    return _LATEX_STRIPPED_CHARS_RE.sub("", content.replace("~", ""))
+
+
+def _repair_display_dollars(markdown: str) -> str:
+    """Drop unpaired and empty ``$$`` delimiters left by a truncated crop."""
+    tokens = _DISPLAY_DOLLAR_SPLIT_RE.split(markdown)
+    output: list[str] = []
+    in_display = False
+    for index, token in enumerate(tokens):
+        if token != "$$":
+            output.append(token)
+            continue
+        next_segment = tokens[index + 1] if index + 1 < len(tokens) else ""
+        next_is_delimiter = index + 2 < len(tokens) and tokens[index + 2] == "$$"
+        has_later_delimiter = any(part == "$$" for part in tokens[index + 2 :])
+        if not in_display:
+            if (
+                not next_segment.strip() and next_is_delimiter
+            ) or not has_later_delimiter:
+                continue
+            output.append(token)
+            in_display = True
+        else:
+            output.append(token)
+            in_display = False
+    if in_display:
+        output.pop()
+    return "".join(output)
+
+
+def _repair_display_formula(content: str) -> str:
+    """Repair malformed display math without canonicalizing formula content."""
+    content = _repair_display_dollars(content)
+    content = _EMPTY_BRACKET_MATH_RE.sub(" ", content)
+
+    def clean_span(match: re.Match[str]) -> str:
+        whole = match.group(0)
+        is_bracket = whole.startswith(r"\[")
+        body = match.group(1) if is_bracket else match.group(2)
+        stripped = body.rstrip()
+        trailing_whitespace = body[len(stripped) :]
+        if _TRAILING_BACKSLASH_RE.search(stripped):
+            body = stripped[:-1] + trailing_whitespace
+        if body.strip() and not _strip_spacing_tokens(body):
+            return " "
+        return (r"\[" + body + r"\]") if is_bracket else f"$${body}$$"
+
+    return _DISPLAY_SPAN_RE.sub(clean_span, content)
+
+
+def _has_mixed_inline_formula_content(content: str) -> bool:
+    """Whether an inline-formula crop also contains ordinary text."""
+    stripped = (content or "").strip()
+    if not stripped:
+        return False
+    if _INLINE_MATH_RE.fullmatch(stripped):
+        return False
+    without_formulas = _INLINE_MATH_RE.sub("", stripped)
+    return bool(without_formulas.strip())
+
+
+def _is_pipe_table_row(line: str) -> bool:
+    stripped = line.strip()
+    return (stripped.count("|") >= 2 and stripped.startswith("|")) or (
+        stripped.count("|") >= 2 and "---" in stripped
+    )
+
+
+def _split_text_block(content: str, *, protect_inline_math: bool = False) -> str:
+    """Re-flow prose lines while preserving Markdown and math structures.
+
+    A crop's line breaks come from the page layout, not from the text, so
+    every plain line becomes its own paragraph. Fenced code, HTML and pipe
+    tables, display math and LaTeX environments are passed through untouched.
+    """
+    lines = content.split("\n")
+    output: list[str] = []
+    in_code = in_dollar = in_bracket = in_html_table = False
+    in_inline_dollar = in_inline_paren = False
+    env_depth = 0
+
+    def protected() -> bool:
+        return (
+            in_code
+            or in_dollar
+            or in_bracket
+            or in_html_table
+            or in_inline_dollar
+            or in_inline_paren
+            or env_depth > 0
+        )
+
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            output.append(line)
+            in_code = not in_code
+            continue
+        if in_code:
+            output.append(line)
+            continue
+
+        if "<table" in stripped.lower():
+            in_html_table = True
+        if in_html_table:
+            output.append(line)
+            if "</table>" in stripped.lower():
+                in_html_table = False
+            continue
+
+        if _is_pipe_table_row(line):
+            output.append(line)
+            next_is_pipe_row = index + 1 < len(lines) and _is_pipe_table_row(
+                lines[index + 1]
+            )
+            if not next_is_pipe_row and output[-1].strip():
+                output.append("")
+            continue
+
+        display_dollar_count = len(_DISPLAY_DOLLAR_RE.findall(line))
+        bracket_opens = r"\[" in line and r"\]" not in line.split(r"\[", 1)[1]
+        inline_dollar_count = len(_INLINE_DOLLAR_RE.findall(line))
+        inline_paren_opens = r"\(" in line and r"\)" not in line.split(r"\(", 1)[1]
+
+        if protected():
+            output.append(line)
+            if in_dollar and display_dollar_count % 2:
+                in_dollar = False
+            if in_bracket and r"\]" in line:
+                in_bracket = False
+            if in_inline_dollar and inline_dollar_count % 2:
+                in_inline_dollar = False
+            if in_inline_paren and r"\)" in line:
+                in_inline_paren = False
+            env_depth = max(
+                0, env_depth + len(_BEGIN_RE.findall(line)) - len(_END_RE.findall(line))
+            )
+            continue
+
+        net_env = len(_BEGIN_RE.findall(line)) - len(_END_RE.findall(line))
+        if display_dollar_count % 2 or bracket_opens or net_env > 0:
+            output.append(line)
+            in_dollar = display_dollar_count % 2 == 1
+            in_bracket = bracket_opens
+            env_depth = max(0, env_depth + net_env)
+            continue
+        if protect_inline_math and (inline_dollar_count % 2 or inline_paren_opens):
+            output.append(line)
+            in_inline_dollar = inline_dollar_count % 2 == 1
+            in_inline_paren = inline_paren_opens
+            continue
+
+        if stripped:
+            if output and output[-1].strip():
+                output.append("")
+            output.extend((stripped, ""))
+
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(output)).strip("\n")
+
+
+def _postprocess_content(
+    content: str,
+    output_format: str,
+    label: str,
+    inline_formula_mixed: bool = False,
+) -> str:
     content = _truncate_repetitive_content(
         content.strip(), 5000 if label == "table" else 50
     )
     if output_format == "latex":
+        if label == "display_formula":
+            content = _repair_display_formula(content)
         for left, right in (("$$", "$$"), ("$", "$"), (r"\(", r"\)"), (r"\[", r"\]")):
             if content.startswith(left) and content.endswith(right):
                 content = content[len(left) : -len(right)].strip()
@@ -451,7 +660,7 @@ def _postprocess_content(content: str, output_format: str, label: str) -> str:
     elif output_format == "html":
         if content.startswith("```html"):
             content = content[7:]
-        elif content.startswith("```"):
+        if content.startswith("```"):
             content = content[3:]
         if content.endswith("```"):
             content = content[:-3]
@@ -472,6 +681,10 @@ def _postprocess_content(content: str, output_format: str, label: str) -> str:
         table_html = convert_otsl_to_html(content)
         if table_html:
             return table_html
+    if label in _TEXT_BLOCK_LABELS:
+        content = _split_text_block(content)
+    elif label == "inline_formula" and inline_formula_mixed:
+        content = _split_text_block(content, protect_inline_math=True)
     return content
 
 
@@ -497,7 +710,7 @@ def _assemble_markdown(blocks: list[OCRBlock]) -> str:
         elif label == "display_formula":
             parts.append(f"$$\n{content}\n$$")
         elif label == "inline_formula":
-            parts.append(f"${content}$")
+            parts.append(content if block.inline_formula_mixed else f"${content}$")
         else:
             parts.append(content)
     return "\n\n".join(parts)
@@ -719,8 +932,12 @@ class OCRPipelineServing:
                 )
             content = crop_response.choices[0].message.content
             raw_content = content if isinstance(content, str) else ""
+            block.inline_formula_mixed = (
+                block.label == "inline_formula"
+                and _has_mixed_inline_formula_content(raw_content)
+            )
             block.content = _postprocess_content(
-                raw_content, output_format, block.label
+                raw_content, output_format, block.label, block.inline_formula_mixed
             )
             usage.prompt_tokens += crop_response.usage.prompt_tokens
             usage.completion_tokens = (usage.completion_tokens or 0) + (
