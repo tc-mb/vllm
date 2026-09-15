@@ -150,12 +150,25 @@ class OCRBlock:
     image: Image.Image
     content: str = ""
     inline_formula_mixed: bool = False
+    raw_content: str = ""
+    output_token_count: int = 0
+    status: str = "ok"
 
 
 @dataclass
 class OCRDocument:
     image: Image.Image | None = None
     pdf_data: bytes | None = None
+
+
+@dataclass
+class OCRPageLayout:
+    """Layout-detection result for one page, plus the OCR blocks."""
+
+    blocks: list["OCRBlock"]
+    raw_boxes: list[dict]      # filtered pre-merge boxes (cls_id/score intact)
+    image_width: int
+    image_height: int
 
 
 class PPDocLayoutService:
@@ -232,7 +245,7 @@ class PPDocLayoutService:
             boxes.append(item)
         return boxes
 
-    def _parse(self, image: Image.Image) -> list[OCRBlock]:
+    def _parse(self, image: Image.Image) -> OCRPageLayout:
         self._load()
         assert self._model is not None
         assert self._crop_by_boxes is not None
@@ -255,6 +268,29 @@ class PPDocLayoutService:
             boxes = self._filter_overlap_boxes({"boxes": boxes}, _LAYOUT_SHAPE_MODE)[
                 "boxes"
             ]
+
+        # Recover cls_id / score / polygon by coordinate key before merge_blocks
+        # strips them (same technique as pip's ppdoclayout3_paddlex adapter).
+        meta_by_coord: dict[tuple, tuple] = {
+            tuple(float(v) for v in b["coordinate"]): (
+                int(b["cls_id"]),
+                float(b["score"]),
+                b.get("polygon_points"),
+            )
+            for b in boxes
+        }
+        # Keep a serialisable copy of filtered boxes for layout_det_res output.
+        filtered_raw_boxes = [
+            {
+                "cls_id": int(b["cls_id"]),
+                "label": b["label"],
+                "score": round(float(b["score"]), 6),
+                "coordinate": [round(float(v), 2) for v in b["coordinate"]],
+                "polygon_points": _polygon_to_list(b.get("polygon_points")),
+            }
+            for b in boxes
+        ]
+
         cropped = self._crop_by_boxes(rgb, boxes, _LAYOUT_SHAPE_MODE) if boxes else []
         merged = self._merge_blocks(
             cropped,
@@ -272,6 +308,8 @@ class PPDocLayoutService:
                 break
             raw_label = str(block["label"])
             x1, y1, x2, y2 = (int(round(float(v))) for v in block["box"])
+            coord_key = tuple(float(v) for v in block["box"])
+            cls_id, score, polygon = meta_by_coord.get(coord_key, (-1, 0.0, None))
             blocks.append(
                 OCRBlock(
                     label=_LABEL_MAP.get(raw_label, raw_label),
@@ -280,9 +318,19 @@ class PPDocLayoutService:
                     image=Image.fromarray(crop),
                 )
             )
-        return blocks
+            # Stash layout metadata directly on the block so it travels through
+            # _process_blocks without needing a separate lookup table.
+            blocks[-1]._cls_id = cls_id
+            blocks[-1]._score = score
+            blocks[-1]._polygon = _polygon_to_list(polygon)
+        return OCRPageLayout(
+            blocks=blocks,
+            raw_boxes=filtered_raw_boxes,
+            image_width=image.width,
+            image_height=image.height,
+        )
 
-    async def parse(self, image: Image.Image) -> list[OCRBlock]:
+    async def parse(self, image: Image.Image) -> OCRPageLayout:
         async with self._lock:
             return await asyncio.to_thread(self._parse, image)
 
@@ -716,6 +764,79 @@ def _assemble_markdown(blocks: list[OCRBlock]) -> str:
     return "\n\n".join(parts)
 
 
+def _polygon_to_list(polygon) -> list[list[float]]:
+    """Convert numpy polygon array or None to a plain list of [x, y] pairs."""
+    if polygon is None:
+        return []
+    try:
+        import numpy as np  # already imported at module level; guarded for safety
+        arr = np.asarray(polygon, dtype=float).reshape(-1, 2)
+        return [[round(float(r[0]), 2), round(float(r[1]), 2)] for r in arr]
+    except Exception:
+        return []
+
+
+def _build_page_layout_json(
+    page_layout: OCRPageLayout,
+    blocks: list[OCRBlock],
+    page_index: int,
+) -> dict:
+    """Build a PaddleX-compatible layout dict for one page.
+
+    The structure mirrors ``layoutParsingResults[n].prunedResult`` from the
+    paddle_ocr_parsing_demo.json reference, keeping ``parsing_res_list`` and
+    ``layout_det_res`` as the two main containers.
+    """
+    parsing_res_list: list[dict] = []
+    for block in sorted(blocks, key=lambda b: b.order):
+        x1, y1, x2, y2 = block.bbox
+        poly = getattr(block, "_polygon", None) or [
+            [float(x1), float(y1)],
+            [float(x2), float(y1)],
+            [float(x2), float(y2)],
+            [float(x1), float(y2)],
+        ]
+        parsing_res_list.append(
+            {
+                "block_label": block.label,
+                "block_content": block.content,
+                "block_bbox": list(block.bbox),
+                "block_id": block.order,
+                "block_order": (
+                    None if block.label in _IGNORE_LABELS else block.order
+                ),
+                "group_id": block.order,
+                "block_polygon_points": poly,
+                # vllm-specific extras (not in the paddle reference schema)
+                "block_status": block.status,
+                "raw_content": block.raw_content,
+                "output_token_count": block.output_token_count,
+                "inline_formula_mixed": block.inline_formula_mixed,
+            }
+        )
+
+    boxes: list[dict] = []
+    for order, rb in enumerate(page_layout.raw_boxes):
+        boxes.append(
+            {
+                "cls_id": rb["cls_id"],
+                "label": rb["label"],
+                "score": rb["score"],
+                "coordinate": rb["coordinate"],
+                "order": order,
+                "polygon_points": rb["polygon_points"],
+            }
+        )
+
+    return {
+        "page_index": page_index,
+        "width": page_layout.image_width,
+        "height": page_layout.image_height,
+        "parsing_res_list": parsing_res_list,
+        "layout_det_res": {"boxes": boxes},
+    }
+
+
 def _page_failure_marker(page_number: int, message: str) -> str:
     message = re.sub(r"\s+", " ", message).replace("--", "- -").strip()
     return f"<!-- Page {page_number} failed: {message[:500]} -->"
@@ -781,17 +902,19 @@ class OCRPipelineServing:
             )
 
         page_markdown: list[str] = []
+        page_layouts: list[OCRPageLayout] = []   # parallel to page_markdown
         usage = UsageInfo()
-        pending_layout: asyncio.Task[list[OCRBlock]] | None = None
+        pending_layout: asyncio.Task[OCRPageLayout] | None = None
         pending_image: Image.Image | None = None
         for page_index in range(page_count):
             image: Image.Image | None = None
+            cur_page_layout: OCRPageLayout | None = None
             blocks: list[OCRBlock] = []
             try:
                 if pending_layout is not None:
                     image = pending_image
                     pending_image = None
-                    blocks = await pending_layout
+                    cur_page_layout = await pending_layout
                     pending_layout = None
                 else:
                     if document.pdf_data is not None:
@@ -803,7 +926,8 @@ class OCRPipelineServing:
                     else:
                         image = document.image
                     assert image is not None
-                    blocks = await self.layout.parse(image)
+                    cur_page_layout = await self.layout.parse(image)
+                blocks = cur_page_layout.blocks
                 if document.pdf_data is not None and page_index + 1 < page_count:
                     pending_image = await asyncio.to_thread(
                         _render_pdf_page,
@@ -822,9 +946,19 @@ class OCRPipelineServing:
                         message,
                     )
                     page_markdown.append(_page_failure_marker(page_index + 1, message))
+                    page_layouts.append(
+                        cur_page_layout
+                        if cur_page_layout is not None
+                        else OCRPageLayout([], [], 0, 0)
+                    )
                     continue
                 markdown, page_usage = page_result
                 page_markdown.append(markdown)
+                page_layouts.append(
+                    cur_page_layout
+                    if cur_page_layout is not None
+                    else OCRPageLayout([], [], 0, 0)
+                )
                 usage.prompt_tokens += page_usage.prompt_tokens
                 usage.completion_tokens = (usage.completion_tokens or 0) + (
                     page_usage.completion_tokens or 0
@@ -835,9 +969,11 @@ class OCRPipelineServing:
                     "OCR processing failed for page %d: %s", page_index + 1, exc
                 )
                 page_markdown.append(_page_failure_marker(page_index + 1, str(exc)))
+                page_layouts.append(OCRPageLayout([], [], 0, 0))
             except Exception as exc:
                 logger.exception("OCR processing failed for page %d", page_index + 1)
                 page_markdown.append(_page_failure_marker(page_index + 1, str(exc)))
+                page_layouts.append(OCRPageLayout([], [], 0, 0))
             finally:
                 for block in blocks:
                     block.image.close()
@@ -858,6 +994,11 @@ class OCRPipelineServing:
                 for index, content in enumerate(page_markdown, start=1)
             )
         response = self._make_response(request, markdown, usage=usage)
+        if request.ocr_return_layout:
+            response.ocr_layout = [
+                _build_page_layout_json(pl, pl.blocks, idx + 1)
+                for idx, pl in enumerate(page_layouts)
+            ]
         if request.stream:
             return self._stream_response(response)
         return response
@@ -865,11 +1006,11 @@ class OCRPipelineServing:
     async def _process_page(
         self, request: ChatCompletionRequest, image: Image.Image
     ) -> tuple[str, UsageInfo] | ErrorResponse:
-        blocks = await self.layout.parse(image)
+        page_layout = await self.layout.parse(image)
         try:
-            return await self._process_blocks(request, blocks)
+            return await self._process_blocks(request, page_layout.blocks)
         finally:
-            for block in blocks:
+            for block in page_layout.blocks:
                 block.image.close()
 
     async def _process_blocks(
@@ -922,20 +1063,35 @@ class OCRPipelineServing:
         results = await asyncio.gather(*[_one(block) for block in ordered])
         usage = UsageInfo()
         for block, output_format, crop_response in results:
-            if isinstance(crop_response, ErrorResponse):
-                return crop_response
             if not isinstance(crop_response, ChatCompletionResponse):
-                return self.batch_serving.create_error_response(
-                    "Unexpected streaming response from OCR crop inference",
-                    err_type="InternalServerError",
-                    status_code=500,
+                # Unexpected streaming response is a server-side bug; fail page.
+                if not isinstance(crop_response, ErrorResponse):
+                    return self.batch_serving.create_error_response(
+                        "Unexpected streaming response from OCR crop inference",
+                        err_type="InternalServerError",
+                        status_code=500,
+                    )
+                # Per-block error: degrade gracefully instead of failing page.
+                logger.warning(
+                    "OCR crop inference failed for block (label=%s order=%d): %s",
+                    block.label,
+                    block.order,
+                    crop_response.error.message,
                 )
+                block.status = "error"
+                block.raw_content = ""
+                block.content = ""
+                block.output_token_count = 0
+                continue
             content = crop_response.choices[0].message.content
             raw_content = content if isinstance(content, str) else ""
             block.inline_formula_mixed = (
                 block.label == "inline_formula"
                 and _has_mixed_inline_formula_content(raw_content)
             )
+            block.raw_content = raw_content
+            block.output_token_count = crop_response.usage.completion_tokens or 0
+            block.status = "ok"
             block.content = _postprocess_content(
                 raw_content, output_format, block.label, block.inline_formula_mixed
             )

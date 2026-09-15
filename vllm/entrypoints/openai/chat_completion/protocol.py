@@ -422,6 +422,17 @@ class ChatCompletionRequest(OpenAIBaseModel):
         ),
     )
 
+    # OCR pipeline – return layout detection result alongside markdown
+    ocr_return_layout: bool | None = Field(
+        default=None,
+        description=(
+            "If true, the OCR pipeline response will include an "
+            "``ocr_layout`` field containing per-page layout-detection "
+            "results in PaddleX-compatible format (``parsing_res_list`` "
+            "and ``layout_det_res``). Ignored for non-OCR requests."
+        ),
+    )
+
     return_assistant_tokens_mask: bool = Field(
         default=False,
         description=(
