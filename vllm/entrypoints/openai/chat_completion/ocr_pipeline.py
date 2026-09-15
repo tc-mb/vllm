@@ -18,6 +18,7 @@ from PIL import Image
 from vllm.entrypoints.openai.chat_completion.batch_serving import (
     OpenAIServingChatBatch,
 )
+from vllm.entrypoints.openai.chat_completion.otsl import convert_otsl_to_html
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -465,7 +466,13 @@ def _postprocess_content(content: str, output_format: str, label: str) -> str:
             lambda match: f"${match.group(1).strip()}$", content
         )
     content = re.sub(r"[ \t]+", " ", content)
-    return re.sub(r"\n{3,}", "\n\n", content)
+    content = re.sub(r"\n{3,}", "\n\n", content)
+    if label == "table":
+        # OTSL output converts to HTML; anything else falls through unchanged.
+        table_html = convert_otsl_to_html(content)
+        if table_html:
+            return table_html
+    return content
 
 
 def _assemble_markdown(blocks: list[OCRBlock]) -> str:
