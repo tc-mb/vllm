@@ -78,6 +78,12 @@ def _minicpmv4_6_field_config(hf_inputs: Mapping[str, torch.Tensor]):
         pixel_values=MultiModalFieldConfig.batched("image"),
         tgt_sizes=MultiModalFieldConfig.batched("image"),
         image_embeds=MultiModalFieldConfig.batched("image"),
+        # Slicing grid ([rows, cols]) actually produced by the HF image
+        # processor for each image. Used by `_get_prompt_updates` so that the
+        # number of image placeholders follows the real processor output
+        # instead of being re-derived from the image size alone (image
+        # processors with content-dependent resizing make the two differ).
+        image_grids=MultiModalFieldConfig.batched("image", keep_on_cpu=True),
         video_pixel_values=MultiModalFieldConfig.batched("video"),
         video_image_sizes=MultiModalFieldConfig.batched("video", keep_on_cpu=True),
         video_tgt_sizes=MultiModalFieldConfig.batched("video"),
@@ -181,10 +187,19 @@ class MiniCPMV4_6MultiModalProcessor(MiniCPMVMultiModalProcessor):
         patch_size = image_processor.patch_size
         per_image_pixel_values: list[torch.Tensor] = []
         per_image_tgt_sizes: list[torch.Tensor] = []
+        per_image_grids: list[torch.Tensor] = []
         for image in parsed_images:
             ip_out = image_processor([image], **mm_kwargs)
             pv = ip_out["pixel_values"]  # (1, C, P, sum_W)
             ts = ip_out["target_sizes"]  # (n_slices, 2)
+            # `grids`: [[rows, cols]] for the single image processed here.
+            g = ip_out.get("grids")
+            try:
+                g0 = g[0] if isinstance(g, (list, tuple)) and len(g) > 0 else g
+                g_rows, g_cols = int(g0[0]), int(g0[1])
+            except Exception:
+                g_rows, g_cols = 0, 0
+            per_image_grids.append(torch.tensor([g_rows, g_cols], dtype=torch.long))
             if pv.ndim == 4 and pv.shape[0] == 1:
                 pv = pv.squeeze(0)  # (C, P, sum_W)
             ts_long = ts.to(torch.long)
@@ -208,6 +223,7 @@ class MiniCPMV4_6MultiModalProcessor(MiniCPMVMultiModalProcessor):
         image_inputs: dict = {
             "pixel_values": per_image_pixel_values,
             "tgt_sizes": per_image_tgt_sizes,
+            "image_grids": per_image_grids,
         }
 
         ds_mode = self._resolve_downsample_mode(mm_kwargs)
@@ -349,6 +365,43 @@ class MiniCPMV4_6MultiModalProcessor(MiniCPMVMultiModalProcessor):
         video_embed_ids = [vocab[video_embed_text]]
 
         def get_image_replacement(item_idx: int):
+            # Prefer the slice geometry the HF image processor actually
+            # produced (`tgt_sizes` / `image_grids`): the placeholder count must
+            # equal the number of visual embeddings the vision tower emits, and
+            # image processors with content-dependent resizing (e.g. adaptive
+            # small-image upsizing) cannot be reproduced from the image size
+            # alone. Fall back to the size-based formula when processed data is
+            # unavailable (e.g. precomputed image embeddings).
+            image_mm_kwargs = out_mm_kwargs.get("image")
+            if image_mm_kwargs is not None and item_idx < len(image_mm_kwargs):
+                image_item = image_mm_kwargs[item_idx]
+                ts_elem = image_item.get("tgt_sizes")
+                gr_elem = image_item.get("image_grids")
+                if ts_elem is not None and ts_elem.data is not None:
+                    ts = ts_elem.data
+                    divisor = 4 if ds_mode == "4x" else 16
+                    source_tokens = int(ts[0, 0]) * int(ts[0, 1]) // divisor
+                    grids = [0, 0]
+                    patch_tokens = 0
+                    if ts.shape[0] > 1:
+                        patch_tokens = int(ts[1, 0]) * int(ts[1, 1]) // divisor
+                        if gr_elem is not None and gr_elem.data is not None:
+                            grids = [int(gr_elem.data[0]), int(gr_elem.data[1])]
+                        if grids[0] * grids[1] != ts.shape[0] - 1:
+                            grids = [1, int(ts.shape[0]) - 1]
+                    return PromptUpdateDetails.select_token_ids(
+                        cached_encode(
+                            tokenizer,
+                            self.info.render_image_placeholder(
+                                grids,
+                                source_tokens,
+                                patch_tokens,
+                                image_idx=item_idx,
+                            ),
+                            add_special_tokens=False,
+                        ),
+                        image_embed_ids,
+                    )
             images = mm_items.get_items(
                 "image",
                 (MiniCPMVImageEmbeddingItems, ImageProcessorItems),
@@ -642,6 +695,28 @@ class MiniCPMV4_6ProcessingInfo(MiniCPMVProcessingInfo):
                 source_image_visual_tokens=source_tokens,
                 patch_visual_tokens=patch_tokens,
             )
+        return self.render_image_placeholder(
+            grids,
+            source_tokens,
+            patch_tokens,
+            image_idx=image_idx,
+            use_image_id=use_image_id,
+        )
+
+    def render_image_placeholder(
+        self,
+        grids,
+        source_tokens: int,
+        patch_tokens: int,
+        image_idx: int = 0,
+        use_image_id: bool = True,
+    ) -> str:
+        """Render the image placeholder text from explicit slice geometry.
+
+        `grids` is [num_rows, num_cols] of the slice grid ([0, 0] when the
+        image is not sliced); `source_tokens` / `patch_tokens` are the number
+        of visual tokens of the source image and of each slice respectively.
+        """
         tokenizer = self.get_tokenizer()
         image_token = getattr(tokenizer, "image_token", "<|image_pad|>")
         image_start = getattr(tokenizer, "image_start_token", "<image>")
